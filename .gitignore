@@ -1,0 +1,8 @@
+# Your atlases, settings and logs stay on your computer
+/db/
+/logs/
+/oracle.config.json
+/oracle.config.json.tmp
+__pycache__/
+*.pyc
+.DS_Store

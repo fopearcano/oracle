@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Oracle atlases</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%233b4fd8'/%3E%3Cpath d='M5 16c3-5 7-7.5 11-7.5S24 11 27 16c-3 5-7 7.5-11 7.5S8 21 5 16z' fill='%23fff'/%3E%3Ccircle cx='16' cy='16' r='4' fill='%233b4fd8'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #f5f4ef;
+    --surface: #ffffff;
+    --surface-2: #eeece5;
+    --text: #1c1b18;
+    --muted: #6a675f;
+    --line: #e1ded5;
+    --accent: #3b4fd8;
+    --accent-ink: #ffffff;
+    --ok: #18804a;
+    --warn: #b06d0f;
+    --bad: #c0362c;
+    --info: #2a68b0;
+    --idle: #8b887f;
+    --shadow: 0 1px 2px rgb(0 0 0 / .04), 0 6px 20px rgb(0 0 0 / .05);
+    --radius: 14px;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121315;
+      --surface: #1b1d20;
+      --surface-2: #24272b;
+      --text: #ecebe6;
+      --muted: #9b9a94;
+      --line: #2e3136;
+      --accent: #7d8cff;
+      --accent-ink: #0d0f1c;
+      --ok: #4fc283;
+      --warn: #e2a64a;
+      --bad: #f07368;
+      --info: #6aa8ef;
+      --idle: #85847e;
+      --shadow: 0 1px 2px rgb(0 0 0 / .3), 0 8px 24px rgb(0 0 0 / .25);
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 16px 48px; }
+
+  header.top { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; justify-content: space-between; }
+  .brand { display: flex; gap: 12px; align-items: center; min-width: 0; }
+  .brand svg { flex: none; width: 40px; height: 40px; }
+  h1 { margin: 0; font-size: 22px; letter-spacing: -.01em; }
+  .folder { margin: 2px 0 0; color: var(--muted); font-size: 13px; font-family: var(--mono); overflow-wrap: anywhere; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+  button, .btn {
+    font: inherit; font-size: 13.5px; font-weight: 550;
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 7px 12px; border-radius: 9px; border: 1px solid var(--line);
+    background: var(--surface); color: var(--text); cursor: pointer; text-decoration: none;
+    transition: background .12s, border-color .12s, opacity .12s;
+  }
+  button:hover, .btn:hover { border-color: var(--muted); }
+  button:disabled { opacity: .45; cursor: default; }
+  button:focus-visible, .btn:focus-visible, input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+  .primary:hover { border-color: var(--accent); filter: brightness(1.07); }
+  .quiet { background: transparent; }
+  .danger:hover { border-color: var(--bad); color: var(--bad); }
+
+  .summary { display: flex; flex-wrap: wrap; gap: 8px 22px; margin: 22px 0 6px; color: var(--muted); font-size: 14px; }
+  .summary b { color: var(--text); font-variant-numeric: tabular-nums; }
+  .banner { margin: 18px 0 0; padding: 12px 14px; border-radius: 10px; background: var(--surface-2); color: var(--text); font-size: 14px; }
+  .banner code { font-family: var(--mono); font-size: 13px; }
+  .banner.offline { border-left: 3px solid var(--bad); }
+
+  h2 { margin: 30px 0 12px; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 650; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 14px; }
+
+  .card {
+    display: flex; flex-direction: column; gap: 6px;
+    background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 16px 16px 14px; box-shadow: var(--shadow); min-width: 0;
+  }
+  .card.missing { box-shadow: none; background: transparent; border-style: dashed; }
+  .card-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .pill { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; font-weight: 600; color: var(--c, var(--idle)); }
+  .pill i { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  .s-running { --c: var(--ok); }
+  .s-starting, .s-installing, .s-syncing { --c: var(--warn); }
+  .s-starting .pill i, .s-installing .pill i, .s-syncing .pill i { animation: pulse 1s ease-in-out infinite; }
+  .s-external { --c: var(--info); }
+  .s-crashed, .s-error { --c: var(--bad); }
+  @keyframes pulse { 50% { opacity: .25; } }
+  @media (prefers-reduced-motion: reduce) { .pill i { animation: none !important; } }
+  .port { font-family: var(--mono); font-size: 12.5px; color: var(--muted); }
+  .card h3 { margin: 4px 0 0; font-size: 17px; letter-spacing: -.005em; }
+  .meta { margin: 0; font-size: 12.5px; color: var(--muted); font-family: var(--mono); }
+  .about { margin: 2px 0 0; color: var(--muted); font-size: 13.5px;
+           display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+  .msg { margin: 4px 0 0; font-size: 13px; color: var(--c, var(--muted)); overflow-wrap: anywhere; }
+  .msg code { font-family: var(--mono); font-size: 12px; }
+  .card-bottom { margin-top: auto; padding-top: 10px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; }
+  .btns { display: flex; flex-wrap: wrap; gap: 6px; }
+
+  .switch { display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); cursor: pointer; user-select: none; }
+  .switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  .track { position: relative; width: 32px; height: 18px; border-radius: 99px; background: var(--surface-2); border: 1px solid var(--line); transition: background .15s; }
+  .track::after { content: ""; position: absolute; top: 2px; left: 2px; width: 12px; height: 12px; border-radius: 50%; background: var(--idle); transition: transform .15s, background .15s; }
+  .switch input:checked + .track { background: var(--accent); border-color: var(--accent); }
+  .switch input:checked + .track::after { transform: translateX(14px); background: var(--accent-ink); }
+
+  .empty { padding: 26px; border: 1px dashed var(--line); border-radius: var(--radius); color: var(--muted); }
+  .empty code { font-family: var(--mono); color: var(--text); }
+
+  footer { margin-top: 40px; color: var(--muted); font-size: 13px; }
+  footer code { font-family: var(--mono); font-size: 12.5px; color: var(--text); }
+
+  dialog { width: min(920px, calc(100vw - 32px)); max-height: calc(100vh - 64px); padding: 0; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); color: var(--text); box-shadow: 0 20px 60px rgb(0 0 0 / .3); }
+  dialog::backdrop { background: rgb(0 0 0 / .35); }
+  .dlg-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+  .dlg-head h3 { margin: 0; font-size: 15px; }
+  dialog pre { margin: 0; padding: 14px 16px; height: min(60vh, 560px); overflow: auto; font: 12.5px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; background: var(--surface-2); }
+
+  #toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); max-width: calc(100vw - 32px); padding: 10px 14px; border-radius: 10px; background: var(--text); color: var(--bg); font-size: 14px; opacity: 0; pointer-events: none; transition: opacity .2s; }
+  #toast.show { opacity: 1; }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="15" fill="var(--accent)"/><path d="M5 16c3-5 7-7.5 11-7.5S24 11 27 16c-3 5-7 7.5-11 7.5S8 21 5 16z" fill="var(--surface)"/><circle cx="16" cy="16" r="4.2" fill="var(--accent)"/></svg>
+      <div>
+        <h1>Oracle</h1>
+        <p class="folder" id="folder">connecting&hellip;</p>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="primary" data-global="start-selected" title="Start every atlas that has Autostart on">Start selected</button>
+      <button data-global="stop-all">Stop all</button>
+      <button data-global="rescan" title="Look for atlases added to the folder">Rescan folder</button>
+      <button class="quiet danger" data-global="shutdown" title="Stop every atlas and quit Oracle">Quit Oracle</button>
+    </div>
+  </header>
+
+  <div id="banner"></div>
+  <div class="summary" id="summary" aria-live="polite"></div>
+  <main id="main"></main>
+
+  <footer>
+    Autostart decides which atlases start with Oracle. To start Oracle itself when you log in, run
+    <code>python3 oracle.py autostart on</code>.
+  </footer>
+</div>
+
+<dialog id="log" aria-labelledby="log-title">
+  <div class="dlg-head">
+    <h3 id="log-title">Log</h3>
+    <button class="quiet" id="log-close">Close</button>
+  </div>
+  <pre id="log-text"></pre>
+</dialog>
+<div id="toast" role="status"></div>
+
+<script>
+(() => {
+  const $ = (sel) => document.querySelector(sel);
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const codeify = (s) => esc(s).replace(/`([^`]+)`/g, "<code>$1</code>");
+
+  const LABEL = {
+    running: "Running", starting: "Starting", installing: "Installing", syncing: "Downloading",
+    external: "Already running", stopped: "Stopped", crashed: "Crashed", error: "Can't start", missing: "Not in folder",
+  };
+  const KIND = { static: "static site", node: "node server", npm: "npm app", cmd: "custom command" };
+
+  let last = "";
+  let data = null;
+  let online = true;
+  let timer = null;
+  let logName = null;
+
+  async function api(path, body) {
+    const opts = { headers: { "X-Oracle": "1", "Content-Type": "application/json" } };
+    if (body !== undefined) { opts.method = "POST"; opts.body = JSON.stringify(body); }
+    const res = await fetch(path, opts);
+    const isJson = (res.headers.get("Content-Type") || "").includes("json");
+    const payload = isJson ? await res.json() : await res.text();
+    if (!res.ok) throw new Error((payload && payload.error) || res.statusText);
+    return payload;
+  }
+
+  function toast(text) {
+    const t = $("#toast");
+    t.textContent = text;
+    t.classList.add("show");
+    clearTimeout(toast.h);
+    toast.h = setTimeout(() => t.classList.remove("show"), 3200);
+  }
+
+  function uptime(s) {
+    if (s == null) return "";
+    if (s < 60) return "just started";
+    if (s < 3600) return `up ${Math.floor(s / 60)} min`;
+    if (s < 86400) return `up ${Math.floor(s / 3600)} h ${Math.floor((s % 3600) / 60)} min`;
+    return `up ${Math.floor(s / 86400)} d`;
+  }
+
+  function card(a) {
+    const live = a.state === "running" || a.state === "external";
+    const busy = ["starting", "installing", "syncing"].includes(a.state);
+    const btn = [];
+    if (live) btn.push(`<a class="btn primary" href="http://localhost:${a.port}/" target="_blank" rel="noopener">Open</a>`);
+    if (a.present && !live && !busy && a.state !== "error") btn.push(`<button class="primary" data-act="start" data-name="${esc(a.name)}">Start</button>`);
+    if (a.state === "running" || a.state === "starting" || a.state === "installing") btn.push(`<button data-act="stop" data-name="${esc(a.name)}">Stop</button>`);
+    if (a.state === "running" || a.state === "crashed") btn.push(`<button class="quiet" data-act="restart" data-name="${esc(a.name)}">Restart</button>`);
+    if (a.state === "error" && a.present) btn.push(`<button class="quiet" data-act="start" data-name="${esc(a.name)}">Try again</button>`);
+    if (!a.present && a.repo && a.state !== "syncing") btn.push(`<button class="primary" data-act="download" data-name="${esc(a.name)}" title="git clone github.com/${esc(a.repo)}">Download</button>`);
+    if (a.has_log) btn.push(`<button class="quiet" data-log="${esc(a.name)}">Log</button>`);
+
+    let msg = a.message;
+    if (a.state === "running") msg = uptime(a.uptime);
+    if (!a.present && a.state === "missing") msg = a.repo ? `Not in the folder yet. Download clones github.com/${a.repo}.` : "Not in the folder.";
+
+    const meta = [a.name, KIND[a.kind] || "unknown", a.auto_port ? "port picked by Oracle" : ""].filter(Boolean).join(" · ");
+    return `
+      <article class="card s-${esc(a.state)}${a.present ? "" : " missing"}">
+        <div class="card-top">
+          <span class="pill"><i></i>${esc(LABEL[a.state] || a.state)}</span>
+          <span class="port">${a.port ? ":" + esc(a.port) : ""}</span>
+        </div>
+        <h3>${esc(a.title)}</h3>
+        <p class="meta">${esc(meta)}</p>
+        ${a.about ? `<p class="about">${esc(a.about)}</p>` : ""}
+        ${msg ? `<p class="msg">${codeify(msg)}</p>` : ""}
+        <div class="card-bottom">
+          <div class="btns">${btn.join("")}</div>
+          <label class="switch" title="Start this one whenever Oracle starts">
+            <input type="checkbox" data-select="${esc(a.name)}" ${a.selected ? "checked" : ""}>
+            <span class="track"></span>Autostart
+          </label>
+        </div>
+      </article>`;
+  }
+
+  function render(d) {
+    const key = JSON.stringify(d.atlases.map(({ uptime, ...rest }) => ({ ...rest, up: rest.state === "running" ? Math.floor((uptime || 0) / 60) : 0 })).concat([d.db, d.lan_ip]));
+    if (key === last) return;
+    last = key;
+
+    $("#folder").textContent = d.db;
+    const present = d.atlases.filter((a) => a.present);
+    const missing = d.atlases.filter((a) => !a.present);
+    const running = present.filter((a) => a.state === "running" || a.state === "external").length;
+    const problems = present.filter((a) => a.state === "error" || a.state === "crashed").length;
+    const auto = present.filter((a) => a.selected).length;
+
+    $("#summary").innerHTML = [
+      `<span><b>${running}</b> of ${present.length} running</span>`,
+      `<span><b>${auto}</b> start automatically</span>`,
+      problems ? `<span style="color:var(--bad)"><b style="color:inherit">${problems}</b> need attention</span>` : "",
+      d.lan && d.lan_ip ? `<span>On your network: <b>http://${esc(d.lan_ip)}:&lt;port&gt;</b></span>` : "",
+    ].join("");
+
+    let html = "";
+    if (!present.length) {
+      html += `<div class="empty" style="margin-top:22px">There are no atlases in <code>${esc(d.db)}</code> yet.
+        Put the atlas folders there and press <b>Rescan folder</b>, download them below,
+        or point Oracle at another folder with <code>python3 oracle.py config --db DIR</code>.</div>`;
+    }
+    const groups = [];
+    for (const a of present) {
+      let g = groups.find((x) => x.name === a.group);
+      if (!g) groups.push((g = { name: a.group, items: [] }));
+      g.items.push(a);
+    }
+    for (const g of groups) html += `<h2>${esc(g.name)}</h2><div class="grid">${g.items.map(card).join("")}</div>`;
+    if (missing.length) html += `<h2>Not in the folder</h2><div class="grid">${missing.map(card).join("")}</div>`;
+    $("#main").innerHTML = html;
+  }
+
+  async function refresh() {
+    clearTimeout(timer);
+    try {
+      data = await api("/api/status");
+      if (!online) { online = true; $("#banner").innerHTML = ""; }
+      render(data);
+      if (logName) await loadLog();
+      timer = setTimeout(refresh, 1500);
+    } catch (e) {
+      if (online) {
+        online = false;
+        last = "";
+        $("#banner").innerHTML = `<div class="banner offline">Oracle isn't running. Start it again with <code>python3 oracle.py</code>; this page reconnects by itself.</div>`;
+      }
+      timer = setTimeout(refresh, 4000);
+    }
+  }
+
+  async function act(path, body = {}) {
+    last = "";   // redraw even if nothing changed, so clicked buttons come back
+    try {
+      const d = await api(path, body);
+      if (d && d.atlases) { data = d; render(d); }
+    } catch (e) {
+      toast(e.message || "That didn't work.");
+    }
+    setTimeout(refresh, 400);
+  }
+
+  async function loadLog() {
+    const pre = $("#log-text");
+    const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40;
+    try {
+      const text = await api(`/api/logs/${encodeURIComponent(logName)}`);
+      if (pre.textContent !== text) {
+        pre.textContent = text || "(the log is empty)";
+        if (atBottom) pre.scrollTop = pre.scrollHeight;
+      }
+    } catch (e) { pre.textContent = e.message; }
+  }
+
+  document.addEventListener("click", async (ev) => {
+    const g = ev.target.closest("[data-global]");
+    if (g) {
+      const what = g.dataset.global;
+      if (what === "shutdown" && !confirm("Stop every atlas and quit Oracle?")) return;
+      if (what === "stop-all") toast("Stopping every atlas…");
+      return act(`/api/${what}`);
+    }
+    const b = ev.target.closest("[data-act]");
+    if (b) {
+      b.disabled = true;
+      if (b.dataset.act === "download") toast("Downloading from GitHub…");
+      return act(`/api/atlas/${encodeURIComponent(b.dataset.name)}/${b.dataset.act}`);
+    }
+    const l = ev.target.closest("[data-log]");
+    if (l) {
+      logName = l.dataset.log;
+      const a = data && data.atlases.find((x) => x.name === logName);
+      $("#log-title").textContent = `Log: ${a ? a.title : logName}`;
+      $("#log-text").textContent = "";
+      $("#log").showModal();
+      await loadLog();
+      $("#log-text").scrollTop = $("#log-text").scrollHeight;
+    }
+  });
+
+  document.addEventListener("change", (ev) => {
+    const s = ev.target.closest("[data-select]");
+    if (s) act(`/api/atlas/${encodeURIComponent(s.dataset.select)}/select`, { selected: s.checked });
+  });
+
+  $("#log-close").addEventListener("click", () => $("#log").close());
+  $("#log").addEventListener("close", () => { logName = null; });
+
+  refresh();
+})();
+</script>
+</body>
+</html>

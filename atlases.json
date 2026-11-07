@@ -1,0 +1,101 @@
+{
+  "github_owner": "fopearcano",
+  "atlases": [
+    {
+      "name": "lit-atlas",
+      "title": "Literary Atlas",
+      "group": "Atlases",
+      "about": "World literature mapped by place, time, concepts and cultural values: 166 works from Gilgamesh to Han Kang.",
+      "kind": "static",
+      "port": 8010
+    },
+    {
+      "name": "cine-atlas",
+      "title": "Cine Atlas",
+      "group": "Atlases",
+      "about": "World cinema organised by the questions films ask and the values they put at stake, with the connections between them.",
+      "kind": "static",
+      "port": 8008
+    },
+    {
+      "name": "trans-atlas",
+      "title": "TRANS-ATLAS",
+      "group": "Atlases",
+      "about": "Events of human history on a map and a timeline, with verifiable metrics and sound comparisons (in Italian).",
+      "kind": "static",
+      "port": 8007
+    },
+    {
+      "name": "math-map",
+      "title": "Atlante Matematico",
+      "group": "Atlases",
+      "about": "A concept map of the main domains, concepts and tools of mathematics (in Italian).",
+      "kind": "static",
+      "port": 8099
+    },
+    {
+      "name": "scifi-map",
+      "title": "Atlas of Imagined Futures",
+      "group": "Atlases",
+      "about": "Science fiction literature as a star chart: 230 works, from Lucian to the present, in fifteen thematic sectors.",
+      "kind": "static",
+      "port": 8001
+    },
+    {
+      "name": "cc-map",
+      "title": "Atlante dei campi",
+      "group": "Atlases",
+      "about": "Concentration, extermination, forced-labour and internment camps around the world, from the 19th century to today (in Italian).",
+      "kind": "node",
+      "entry": "server.js",
+      "port": 8005
+    },
+    {
+      "name": "lang-map",
+      "title": "Linguistic Drift",
+      "group": "Atlases",
+      "about": "How languages change: a concept map of linguistic drift and a world map of 233 languages through time.",
+      "kind": "node",
+      "entry": "server.js",
+      "port": 8004
+    },
+    {
+      "name": "beatgen-map",
+      "title": "Beat Atlas",
+      "group": "Atlases",
+      "about": "The Beat Generation's apartments, bars, bookshops, courtrooms and graves, 1944-1997, drawn like a mid-century road map.",
+      "kind": "static",
+      "port": 8002
+    },
+    {
+      "name": "story",
+      "title": "Story Builder",
+      "group": "Writing tools",
+      "about": "An infographic story builder grounded in Robert McKee's STORY, with an optional AI character agent.",
+      "kind": "node",
+      "entry": "server.js",
+      "port": 4135,
+      "branch": "claude/pensive-clarke-g7vnrx"
+    },
+    {
+      "name": "char-build",
+      "title": "CharBuild",
+      "group": "Writing tools",
+      "about": "A character builder after McKee's CHARACTER: structured, visual and interactive, with an optional AI coach.",
+      "kind": "node",
+      "entry": "server/index.js",
+      "port": 4133,
+      "branch": "claude/intelligent-albattani-gxx38c"
+    },
+    {
+      "name": "dialoguedevil",
+      "title": "Dialogue Devil",
+      "group": "Writing tools",
+      "about": "A dialogue builder grounded in McKee's DIALOGUE, with optional AI character coaching.",
+      "kind": "node",
+      "entry": "server.js",
+      "port": 4134,
+      "branch": "claude/optimistic-pascal-4630j3"
+    }
+  ]
+}
