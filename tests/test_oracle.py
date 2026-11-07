@@ -1,6 +1,8 @@
 """Tests for oracle.py. Run with: python3 -m unittest discover tests"""
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -259,6 +261,7 @@ class DashboardTest(TempDirCase):
             return getattr(e, "code", None), b""
 
     def test_status_and_page(self):
+        self.assertEqual(self.httpd.server_address[0], "127.0.0.1")   # private unless LAN mode
         code, body = self.request("/api/status")
         self.assertEqual(code, 200)
         self.assertEqual(json.loads(body)["atlases"][0]["name"], "site")
@@ -278,6 +281,157 @@ class DashboardTest(TempDirCase):
     def test_call_oracle_finds_a_running_instance(self):
         self.assertEqual(oracle.call_oracle(self.port, "/api/status")["app"], "oracle")
         self.assertIsNone(oracle.call_oracle(free_port(), "/api/status"))
+
+
+class ClientScopeTest(unittest.TestCase):
+    def test_addresses(self):
+        cases = {
+            "127.0.0.1": "local", "::1": "local",
+            "192.168.1.20": "lan", "10.0.0.7": "lan", "172.16.4.2": "lan", "fe80::1": "lan",
+            "::ffff:192.168.1.5": "lan", "100.101.1.2": "lan",          # Tailscale
+            "8.8.8.8": "public", "2a00:1450::1": "public", "nonsense": "public",
+        }
+        for address, scope in cases.items():
+            self.assertEqual(oracle.client_scope(address), scope, address)
+
+    def test_codes_ignore_case_spaces_and_dashes(self):
+        self.assertEqual(oracle.norm_code(" K7MP q2xa "), oracle.norm_code("k7mp-q2xa"))
+        self.assertRegex(oracle.new_code(), r"^[a-z2-9]{4}-[a-z2-9]{4}$")
+
+
+class LanConfigTest(TempDirCase):
+    def run_config(self, *argv):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return oracle.cmd_config(oracle.build_parser().parse_args(["config", *argv]))
+
+    def test_turning_lan_on_creates_an_access_code(self):
+        self.assertEqual(self.run_config("--lan", "on"), 0)
+        cfg = oracle.load_config()
+        self.assertTrue(cfg["lan"])
+        self.assertRegex(cfg["access_code"], r"^[a-z2-9]{4}-[a-z2-9]{4}$")
+        self.assertTrue(cfg["session_secret"])
+        old = cfg["access_code"]
+        self.run_config("--new-code")
+        self.assertNotEqual(oracle.load_config()["access_code"], old)
+        self.assertEqual(self.run_config("--code", "a-b"), 1)          # too short
+        self.run_config("--code", "studio 42")
+        self.assertEqual(oracle.load_config()["access_code"], "studio 42")
+
+    def test_dashboard_toggles_keep_a_code_set_from_the_command_line(self):
+        sup = oracle.Supervisor(self.db, {}, oracle.load_config(), dashboard_port=free_port(), quiet=True)
+        self.run_config("--code", "changed-meanwhile")
+        sup.set_selected("anything", False)
+        cfg = oracle.load_config()
+        self.assertEqual((cfg["access_code"], cfg["skip"]), ("changed-meanwhile", ["anything"]))
+
+
+class RemoteDashboardTest(TempDirCase):
+    """Another device on the network, simulated by faking the client address.
+
+    The test server still listens on 127.0.0.1 only."""
+
+    def setUp(self):
+        super().setUp()
+        cfg = oracle.load_config()
+        oracle.ensure_access_code(cfg)
+        cfg["access_code"] = "k7mp-q2xa"
+        oracle.save_config(cfg)
+        self.port = free_port()
+        self.sup = oracle.Supervisor(self.db, {}, cfg, dashboard_port=self.port, quiet=True)
+        self.sup.lan = True
+        self.httpd = oracle.make_dashboard(self.sup, self.port, bind="127.0.0.1")
+        self.ip = "192.168.1.50"
+        patch = mock.patch.object(oracle.DashboardHandler, "_client_ip", lambda handler: self.ip)
+        patch.start()
+        self.addCleanup(patch.stop)
+        import threading
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        super().tearDown()
+
+    def request(self, path, body=None, cookie=None, header=True):
+        headers = {"Content-Type": "application/json"}
+        if header:
+            headers["X-Oracle"] = "1"
+        if cookie:
+            headers["Cookie"] = cookie
+        req = Request(f"http://127.0.0.1:{self.port}{path}",
+                      data=None if body is None else json.dumps(body).encode(),
+                      headers=headers, method="GET" if body is None else "POST")
+        try:
+            with opener.open(req, timeout=5) as resp:
+                return resp.status, resp.read(), resp.headers
+        except Exception as e:
+            return getattr(e, "code", None), b"", getattr(e, "headers", {})
+
+    def login(self, code="k7mp-q2xa"):
+        status, _, headers = self.request("/api/login", {"code": code})
+        cookie = (headers.get("Set-Cookie") or "").split(";")[0] if status == 200 else None
+        return status, cookie
+
+    def test_the_page_loads_but_the_api_wants_the_code(self):
+        self.assertEqual(self.request("/")[0], 200)
+        self.assertEqual(self.request("/api/status")[0], 401)
+        self.assertEqual(self.request("/api/rescan", {})[0], 401)
+
+    def test_right_code_gives_a_session(self):
+        self.assertEqual(self.login("wrong-code")[0], 401)
+        status, cookie = self.login(" K7MP Q2XA ")
+        self.assertEqual(status, 200)
+        self.assertTrue(cookie.startswith("oracle_session="))
+        status, body, _ = self.request("/api/status", cookie=cookie)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["client"], "lan")
+        self.assertNotIn("access_code", data)       # never shown to other devices
+
+    def test_cookie_is_http_only_and_same_site(self):
+        status, _, headers = self.request("/api/login", {"code": "k7mp-q2xa"})
+        self.assertIn("HttpOnly", headers["Set-Cookie"])
+        self.assertIn("SameSite=Strict", headers["Set-Cookie"])
+
+    def test_other_devices_cannot_quit_oracle(self):
+        _, cookie = self.login()
+        self.assertEqual(self.request("/api/shutdown", {}, cookie=cookie)[0], 403)
+
+    def test_posts_still_need_the_oracle_header(self):
+        _, cookie = self.login()
+        self.assertEqual(self.request("/api/rescan", {}, cookie=cookie, header=False)[0], 403)
+        self.assertEqual(self.request("/api/rescan", {}, cookie=cookie)[0], 200)
+
+    def test_too_many_wrong_codes(self):
+        for _ in range(oracle.LOGIN_LIMIT):
+            self.assertEqual(self.login("nope-nope")[0], 401)
+        self.assertEqual(self.login()[0], 429)       # even the right one, for a while
+        self.ip = "192.168.1.51"                    # other devices are not affected
+        self.assertEqual(self.login()[0], 200)
+
+    def test_changing_the_code_signs_devices_out(self):
+        _, cookie = self.login()
+        cfg = oracle.load_config()
+        cfg["access_code"] = "brand-new1"
+        oracle.save_config(cfg)
+        self.assertEqual(self.request("/api/status", cookie=cookie)[0], 401)
+
+    def test_public_addresses_are_refused(self):
+        self.ip = "8.8.8.8"
+        self.assertEqual(self.request("/")[0], 403)
+        self.assertEqual(self.login()[0], 403)
+
+    def test_without_lan_mode_other_devices_are_refused(self):
+        self.sup.lan = False
+        self.assertEqual(self.request("/")[0], 403)
+
+    def test_this_computer_needs_no_code_and_sees_it(self):
+        self.ip = "127.0.0.1"
+        status, body, _ = self.request("/api/status")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual((data["client"], data["access_code"]), ("local", "k7mp-q2xa"))
+        self.assertTrue(data["remote_url"].endswith(f":{self.port}"))
 
 
 class AutostartTest(unittest.TestCase):

@@ -125,6 +125,25 @@ To stop the background Oracle and all its atlases, use **Quit Oracle** on the da
 python3 oracle.py stop
 ```
 
+## Using it from a phone or another computer
+
+By default, the atlases and the dashboard listen on this computer only. To open them to your home network:
+
+```bash
+python3 oracle.py config --lan on
+```
+
+Then restart Oracle. To try it for one run without saving the setting, use `python3 oracle.py --lan`.
+
+- **Access code.** Oracle makes one up, such as `k7mp-q2xa`. The dashboard on this computer shows it at the top, together with the address other devices should open, and `python3 oracle.py config` prints it too.
+- **On the phone**, open that address (for example `http://192.168.1.20:8800`) and enter the code once. The phone then stays signed in for 30 days. Capital letters, spaces and dashes in the code don't matter.
+- **What other devices can do:** open, start, stop and restart atlases, download missing ones, and switch Autostart. Only this computer can quit Oracle, so nobody locks you out from the sofa.
+- **Changing the code:** `python3 oracle.py config --new-code` makes a new random one, and `python3 oracle.py config --code "your own code"` sets one you choose. Every device that used the old code is asked for the new one.
+- **Wrong codes:** after five wrong codes, a device has to wait ten minutes before it can try again.
+- **Who can connect:** only devices on a private network, such as home Wi-Fi or a VPN like Tailscale. Public internet addresses are refused, even if you forward the port. The connection is plain HTTP, so use LAN mode on networks you trust: at home, not on café Wi-Fi.
+- **The atlases themselves have no code.** With LAN mode on, anyone on the network can open them. The writing tools keep their own protections. Dialogue Devil can ask for its own code if you set `DD_ACCESS_CODE`, and CharBuild lets only this computer change its AI settings. Story Builder lets anyone who reaches it use an API key set on the server, such as `ANTHROPIC_API_KEY`.
+- **Firewall:** the first time, macOS or Windows may ask whether Python or Node may accept incoming connections. Allow it, or other devices won't get through.
+
 ## Commands
 
 | Command | What it does |
@@ -134,14 +153,14 @@ python3 oracle.py stop
 | `oracle.py select NAME…` / `deselect NAME…` | Turn autostart on or off for these atlases (`--all` for every one) |
 | `oracle.py sync [NAME…]` | Clone missing atlases from GitHub and fast-forward the others (`--selected` for only the selected ones) |
 | `oracle.py stop` | Stop a running Oracle and every atlas it started |
-| `oracle.py config` | Show the settings, or change them with `--db DIR`, `--port N`, `--lan on/off` |
+| `oracle.py config` | Show the settings, or change them with `--db DIR`, `--port N`, `--lan on/off`, `--code CODE`, `--new-code` |
 | `oracle.py autostart on/off/status` | Start Oracle at login |
 
 Settings are saved in `oracle.config.json` next to `oracle.py`. `--db` on a single command, or the `ORACLE_DB` environment variable, overrides the saved folder for that run only.
 
 ## Good to know
 
-- **Network access.** Atlases listen on this computer only (`127.0.0.1`). To open them from a phone or tablet on the same Wi-Fi, run `python3 oracle.py config --lan on`, or pass `--lan` for one run. The dashboard always stays private to this computer.
+- **Network access.** Everything listens on this computer only until you turn LAN mode on (see [Using it from a phone or another computer](#using-it-from-a-phone-or-another-computer)).
 - **"Already running".** If something already answers on an atlas's port (for example, you started it by hand), Oracle leaves it alone and shows it as *Already running*.
 - **Logs.** Each atlas writes its output to `logs/<name>.log`. The dashboard's **Log** button shows the latest part. When an atlas crashes or can't start, the card tells you why.
 - **AI features.** story, char-build and dialoguedevil still take their API key the usual way: in their own Settings, from char-build's `.env`, or from variables such as `ANTHROPIC_API_KEY`. Oracle passes its environment through, so a key that is set when Oracle starts reaches them.

@@ -12,6 +12,7 @@ them, and `oracle.py autostart on` makes it run every time you log in.
     python3 oracle.py deselect NAME... stop starting these automatically
     python3 oracle.py sync [NAME...]   download or update atlases from GitHub
     python3 oracle.py config --db DIR  remember which folder holds the atlases
+    python3 oracle.py config --lan on  open atlases + dashboard to your network
     python3 oracle.py autostart on     run Oracle when you log in
     python3 oracle.py stop             stop a running Oracle and its atlases
 
@@ -23,9 +24,13 @@ from __future__ import annotations
 
 import argparse
 import functools
+import hashlib
+import hmac
+import ipaddress
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import socket
@@ -34,12 +39,13 @@ import sys
 import threading
 import time
 import webbrowser
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 from urllib.request import ProxyHandler, Request, build_opener
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 HERE = Path(__file__).resolve().parent
 REGISTRY_FILE = HERE / "atlases.json"
 CONFIG_FILE = HERE / "oracle.config.json"
@@ -58,7 +64,16 @@ ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 # Requests to Oracle itself must never go through an HTTP proxy.
 _local = build_opener(ProxyHandler({}))
 
-DEFAULT_CONFIG = {"db": None, "port": DEFAULT_PORT, "lan": False, "skip": []}
+DEFAULT_CONFIG = {"db": None, "port": DEFAULT_PORT, "lan": False, "skip": [],
+                  "access_code": None, "session_secret": None}
+
+# Other devices on the network must enter the access code to use the dashboard.
+CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"     # no 0/o, 1/l/i to misread
+COOKIE = "oracle_session"
+COOKIE_DAYS = 30
+LOGIN_LIMIT = 5                 # wrong codes allowed per device...
+LOGIN_WINDOW = 600              # ...in this many seconds
+CGNAT = ipaddress.ip_network("100.64.0.0/10")         # Tailscale and similar VPNs
 
 
 # --------------------------------------------------------------------- utils
@@ -174,6 +189,49 @@ def save_config(cfg: dict) -> None:
     tmp = CONFIG_FILE.with_name(CONFIG_FILE.name + ".tmp")
     tmp.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, CONFIG_FILE)
+
+
+def new_code() -> str:
+    raw = "".join(secrets.choice(CODE_ALPHABET) for _ in range(8))
+    return f"{raw[:4]}-{raw[4:]}"
+
+
+def norm_code(code) -> str:
+    """Codes are compared ignoring case, spaces and dashes ("K7MP Q2XA" == "k7mp-q2xa")."""
+    return re.sub(r"[\s-]+", "", str(code or "")).lower()
+
+
+def ensure_access_code(cfg: dict) -> bool:
+    """Give the config an access code and a session secret; True when it changed."""
+    changed = False
+    if not norm_code(cfg.get("access_code")):
+        cfg["access_code"] = new_code()
+        changed = True
+    if not cfg.get("session_secret"):
+        cfg["session_secret"] = secrets.token_hex(16)
+        changed = True
+    return changed
+
+
+def session_token(cfg: dict) -> str:
+    """What the session cookie holds. Changing the code signs every device out."""
+    return hmac.new(str(cfg["session_secret"]).encode(), norm_code(cfg["access_code"]).encode(),
+                    hashlib.sha256).hexdigest()
+
+
+def client_scope(address: str) -> str:
+    """"local" for this computer, "lan" for a private network, else "public"."""
+    try:
+        ip = ipaddress.ip_address(address.split("%")[0])
+    except ValueError:
+        return "public"
+    if getattr(ip, "ipv4_mapped", None):
+        ip = ip.ipv4_mapped
+    if ip.is_loopback:
+        return "local"
+    if ip.is_private or ip.is_link_local or (ip.version == 4 and ip in CGNAT):
+        return "lan"
+    return "public"
 
 
 def resolve_db(arg, cfg: dict) -> Path:
@@ -674,6 +732,7 @@ class Supervisor:
                  dashboard_port: int = DEFAULT_PORT, quiet: bool = False):
         self.db, self.registry, self.cfg = db, registry, cfg
         self.host, self.dashboard_port, self.quiet = host, dashboard_port, quiet
+        self.lan = host not in LOCAL_HOSTS      # atlases and dashboard open to the network
         self.lock = threading.RLock()
         self.runners: dict = {}
         self.rescan()
@@ -713,10 +772,11 @@ class Supervisor:
 
     def set_selected(self, name: str, selected: bool) -> None:
         with self.lock:
-            skip = set(self.cfg.get("skip", []))
+            fresh = load_config()           # keep changes made with `oracle.py config` meanwhile
+            skip = set(fresh["skip"])
             (skip.discard if selected else skip.add)(name)
-            self.cfg["skip"] = sorted(skip)
-            save_config(self.cfg)
+            fresh["skip"] = self.cfg["skip"] = sorted(skip)
+            save_config(fresh)
 
     def start(self, names=None) -> None:
         with self.lock:
@@ -771,11 +831,10 @@ class Supervisor:
     def status(self) -> dict:
         with self.lock:
             runners = list(self.runners.values())
-        lan = self.host not in LOCAL_HOSTS
         return {
             "app": "oracle", "version": VERSION, "pid": os.getpid(),
             "db": str(self.db), "db_exists": self.db.is_dir(),
-            "lan": lan, "lan_ip": lan_ip() if lan else None,
+            "lan": self.lan, "lan_ip": lan_ip() if self.lan else None,
             "atlases": [r.info(self.is_selected(r.atlas.name)) for r in runners],
         }
 
@@ -819,7 +878,15 @@ def serve_static(root: str, port: int, host: str) -> None:
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
+    """The dashboard and its API.
+
+    This computer may always use it. When LAN mode is on, devices on a private
+    network may use it too, after entering the access code; Quit stays local.
+    Public addresses are always refused.
+    """
+
     server_version = f"Oracle/{VERSION}"
+    scope = "local"
 
     def log_message(self, *args):
         pass
@@ -827,6 +894,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
     @property
     def sup(self) -> Supervisor:
         return self.server.supervisor
+
+    def _client_ip(self) -> str:
+        return self.client_address[0]
 
     def _host_ok(self) -> bool:
         host = (self.headers.get("Host") or "").strip().lower()
@@ -836,31 +906,96 @@ class DashboardHandler(BaseHTTPRequestHandler):
             host = host.rsplit(":", 1)[0]
         return host in LOCAL_HOSTS
 
-    def _send(self, code: int, body: bytes, ctype: str) -> None:
+    def _send(self, code: int, body: bytes, ctype: str, headers=None) -> None:
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
 
-    def _json(self, obj, code: int = 200) -> None:
-        self._send(code, json.dumps(obj).encode(), "application/json; charset=utf-8")
+    def _json(self, obj, code: int = 200, headers=None) -> None:
+        self._send(code, json.dumps(obj).encode(), "application/json; charset=utf-8", headers)
+
+    def _authed(self) -> bool:
+        cfg = load_config()                # read fresh, so `config --new-code` applies at once
+        if not norm_code(cfg.get("access_code")) or not cfg.get("session_secret"):
+            return False
+        jar = SimpleCookie()
+        try:
+            jar.load(self.headers.get("Cookie") or "")
+        except CookieError:
+            return False
+        morsel = jar.get(COOKIE)
+        return morsel is not None and hmac.compare_digest(morsel.value, session_token(cfg))
+
+    def _gate(self, need_code: bool = True) -> bool:
+        """True when this request may go on; otherwise the refusal has been sent."""
+        self.scope = client_scope(self._client_ip())
+        if self.scope == "local":
+            # Checking the Host header stops DNS rebinding: a web page that
+            # points its own domain at 127.0.0.1 still can't use the API.
+            if self._host_ok():
+                return True
+            self._json({"error": "forbidden host"}, 403)
+            return False
+        if self.scope == "public" or not self.sup.lan:
+            self._json({"error": "only devices on your local network may connect"}, 403)
+            return False
+        if need_code and not self._authed():
+            self._json({"error": "access code required", "login": True}, 401)
+            return False
+        return True
+
+    def _login(self, body: dict) -> None:
+        ip, now = self._client_ip(), time.time()
+        with self.server.login_lock:
+            recent = [t for t in self.server.failures.get(ip, []) if now - t < LOGIN_WINDOW]
+            self.server.failures[ip] = recent
+        if len(recent) >= LOGIN_LIMIT:
+            minutes = int(LOGIN_WINDOW - (now - recent[0])) // 60 + 1
+            return self._json({"error": f"Too many wrong codes. Try again in {minutes} min."}, 429)
+        cfg = load_config()
+        good = norm_code(cfg.get("access_code"))
+        given = norm_code(body.get("code"))
+        if not good or not cfg.get("session_secret") or not hmac.compare_digest(given.encode(), good.encode()):
+            with self.server.login_lock:
+                self.server.failures.setdefault(ip, []).append(now)
+            return self._json({"error": "That code isn't right.", "login": True}, 401)
+        with self.server.login_lock:
+            self.server.failures.pop(ip, None)
+        cookie = (f"{COOKIE}={session_token(cfg)}; Path=/; Max-Age={COOKIE_DAYS * 86400}; "
+                  "HttpOnly; SameSite=Strict")
+        self._json({"ok": True}, headers={"Set-Cookie": cookie})
+
+    def _status(self) -> dict:
+        status = self.sup.status()
+        status["client"] = self.scope
+        if self.sup.lan:
+            status["remote_url"] = f"http://{status['lan_ip'] or 'this-computer'}:{self.server.server_address[1]}"
+            if self.scope == "local":      # shown on this computer, to type into a phone
+                status["access_code"] = load_config().get("access_code")
+        return status
 
     def do_GET(self):
-        if not self._host_ok():
-            return self._json({"error": "forbidden host"}, 403)
         path = urlparse(self.path).path
         if path in ("/", "/index.html"):
+            if not self._gate(need_code=False):    # the page asks for the code itself
+                return
             try:
                 body = DASHBOARD_FILE.read_bytes()
             except OSError:
                 return self._json({"error": "dashboard.html is missing"}, 500)
             return self._send(200, body, "text/html; charset=utf-8")
+        if not self._gate():
+            return
         if path == "/api/status":
-            return self._json(self.sup.status())
+            return self._json(self._status())
         if path.startswith("/api/logs/"):
             r = self.sup.runner(unquote(path[len("/api/logs/"):]))
             if r is None:
@@ -873,15 +1008,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         # The custom header can't be sent cross-site without a CORS preflight,
         # which Oracle never answers, so other web pages cannot drive it.
-        if not self._host_ok() or self.headers.get("X-Oracle") != "1":
+        if self.headers.get("X-Oracle") != "1":
             return self._json({"error": "forbidden"}, 403)
-        length = min(int(self.headers.get("Content-Length") or 0), 10_000)
         try:
+            length = min(int(self.headers.get("Content-Length") or 0), 10_000)
             body = json.loads(self.rfile.read(length) or b"{}") if length else {}
         except ValueError:
             body = {}
+        body = body if isinstance(body, dict) else {}
         parts = [unquote(p) for p in urlparse(self.path).path.strip("/").split("/")]
         sup = self.sup
+
+        if parts == ["api", "login"]:
+            if self._gate(need_code=False):
+                self._login(body)
+            return
+        if not self._gate():
+            return
 
         if parts == ["api", "start-selected"]:
             sup.start()
@@ -890,6 +1033,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif parts == ["api", "rescan"]:
             sup.rescan()
         elif parts == ["api", "shutdown"]:
+            if self.scope != "local":
+                return self._json({"error": "Oracle can only be quit on the computer it runs on."}, 403)
             self._json({"ok": True})
             threading.Thread(target=self.server.shutdown, daemon=True).start()
             return
@@ -914,12 +1059,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         else:
             return self._json({"error": "not found"}, 404)
         time.sleep(0.15)    # let a state change land before answering
-        self._json(sup.status())
+        self._json(self._status())
 
 
-def make_dashboard(sup: Supervisor, port: int) -> Server:
-    httpd = Server(("127.0.0.1", port), DashboardHandler)
+def make_dashboard(sup: Supervisor, port: int, bind=None) -> Server:
+    """The dashboard listens on the network only in LAN mode."""
+    httpd = Server((bind or ("0.0.0.0" if sup.lan else "127.0.0.1"), port), DashboardHandler)
     httpd.supervisor = sup
+    httpd.failures, httpd.login_lock = {}, threading.Lock()
     return httpd
 
 
@@ -1001,7 +1148,10 @@ def cmd_start(args) -> int:
             webbrowser.open(url)
         return 0
 
-    host = "0.0.0.0" if (args.lan or cfg.get("lan")) else "127.0.0.1"
+    lan = bool(args.lan or cfg.get("lan"))
+    if lan and ensure_access_code(cfg):
+        save_config(cfg)
+    host = "0.0.0.0" if lan else "127.0.0.1"
     sup = Supervisor(db, load_registry(), cfg, host=host, dashboard_port=port)
     try:
         httpd = make_dashboard(sup, port)
@@ -1025,8 +1175,10 @@ def cmd_start(args) -> int:
             say(f"{n}: not in the folder, skipped")
     sup.start(names)
     say(f"Dashboard: {url}   (Ctrl+C stops Oracle and every atlas it started)")
-    if host != "127.0.0.1":
-        say(f"Atlases are also open to your network at http://{lan_ip() or 'this-computer'}:<port>")
+    if lan:
+        where = lan_ip() or "this-computer"
+        say(f"On your network: dashboard http://{where}:{port} (access code {cfg['access_code']}),")
+        say(f"                 atlases http://{where}:<port>")
     if not args.no_browser:
         threading.Timer(1.0, webbrowser.open, args=(url,)).start()
 
@@ -1140,14 +1292,32 @@ def cmd_config(args) -> int:
     if args.port is not None:
         cfg["port"] = args.port
         changed = True
+    if args.code is not None:
+        if len(norm_code(args.code)) < 4:
+            say("The access code needs at least 4 letters or digits.")
+            return 1
+        cfg["access_code"] = args.code.strip()
+        changed = True
+    if args.new_code:
+        cfg["access_code"] = new_code()
+        changed = True
     if args.lan is not None:
         cfg["lan"] = args.lan == "on"
         changed = True
+    if cfg["lan"] and ensure_access_code(cfg):
+        changed = True
     if changed:
         save_config(cfg)
-    print(json.dumps({**cfg, "db (resolved)": str(resolve_db(None, cfg))}, indent=2))
-    if changed and call_oracle(load_config().get("port") or DEFAULT_PORT, "/api/status"):
-        say("Oracle is running: restart it for this to take effect.")
+    shown = {k: v for k, v in cfg.items() if k != "session_secret"}
+    print(json.dumps({**shown, "db (resolved)": str(resolve_db(None, cfg))}, indent=2))
+    if cfg["lan"]:
+        say(f"Other devices open the dashboard at http://{lan_ip() or 'this-computer'}:{cfg['port']}"
+            f" and enter the access code {cfg['access_code']}")
+    if args.code is not None or args.new_code:
+        say("Devices that used the old code will be asked for the new one.")
+    if args.lan is not None or args.port is not None or args.db is not None:
+        if call_oracle(cfg.get("port") or DEFAULT_PORT, "/api/status"):
+            say("Oracle is running: restart it for this to take effect.")
     return 0
 
 
@@ -1186,7 +1356,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = with_db(sub.add_parser("start", help="start the selected atlases and the dashboard (default)"))
     s.add_argument("--port", type=int, help="dashboard port (default 8800)")
     s.add_argument("--no-browser", action="store_true", help="don't open the dashboard in a browser")
-    s.add_argument("--lan", action="store_true", help="let other devices on your network open the atlases")
+    s.add_argument("--lan", action="store_true",
+                   help="let other devices on your network open the atlases and the dashboard")
     s.add_argument("--all", action="store_true", help="start every atlas in the folder, selected or not")
     s.add_argument("--only", nargs="+", metavar="NAME", help="start just these atlases this time")
 
@@ -1207,7 +1378,10 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("config", help="show or change the saved settings")
     s.add_argument("--db", metavar="DIR", help="folder that holds the atlases ('' resets it)")
     s.add_argument("--port", type=int, help="dashboard port")
-    s.add_argument("--lan", choices=("on", "off"), help="open the atlases to your network")
+    s.add_argument("--lan", choices=("on", "off"),
+                   help="open the atlases and the dashboard (with an access code) to your network")
+    s.add_argument("--code", metavar="CODE", help="set your own access code for other devices")
+    s.add_argument("--new-code", action="store_true", help="replace the access code with a new random one")
 
     s = sub.add_parser("autostart", help="start Oracle when you log in")
     s.add_argument("action", choices=("on", "off", "status"))

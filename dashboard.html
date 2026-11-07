@@ -45,6 +45,7 @@
     }
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   html, body { margin: 0; }
   body {
     background: var(--bg);
@@ -130,6 +131,20 @@
   .dlg-head h3 { margin: 0; font-size: 15px; }
   dialog pre { margin: 0; padding: 14px 16px; height: min(60vh, 560px); overflow: auto; font: 12.5px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; background: var(--surface-2); }
 
+  .netinfo { margin: 14px 0 0; padding: 10px 14px; border-radius: 10px; background: var(--surface-2); font-size: 14px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 16px; }
+  .netinfo b { color: var(--text); font-family: var(--mono); font-size: 13.5px; font-weight: 600; }
+
+  body.locked .actions, body.locked #summary, body.locked #main, body.locked footer, body.locked #net { display: none; }
+  .login { display: none; margin: 56px auto 0; max-width: 380px; }
+  body.locked .login { display: block; }
+  .login form { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 22px; box-shadow: var(--shadow); display: grid; gap: 12px; }
+  .login h2 { margin: 0; font-size: 18px; text-transform: none; letter-spacing: 0; color: var(--text); }
+  .login p { margin: 0; color: var(--muted); font-size: 14px; }
+  .login input { font: 600 20px/1.2 var(--mono); letter-spacing: .08em; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg); color: var(--text); width: 100%; }
+  .login input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .login button { justify-content: center; padding: 10px 12px; font-size: 15px; }
+  .login-err { color: var(--bad) !important; min-height: 1.2em; }
+
   #toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); max-width: calc(100vw - 32px); padding: 10px 14px; border-radius: 10px; background: var(--text); color: var(--bg); font-size: 14px; opacity: 0; pointer-events: none; transition: opacity .2s; }
   #toast.show { opacity: 1; }
   .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
@@ -149,15 +164,27 @@
       <button class="primary" data-global="start-selected" title="Start every atlas that has Autostart on">Start selected</button>
       <button data-global="stop-all">Stop all</button>
       <button data-global="rescan" title="Look for atlases added to the folder">Rescan folder</button>
-      <button class="quiet danger" data-global="shutdown" title="Stop every atlas and quit Oracle">Quit Oracle</button>
+      <button class="quiet danger" data-global="shutdown" id="quit" title="Stop every atlas and quit Oracle">Quit Oracle</button>
     </div>
   </header>
 
+  <section class="login" aria-labelledby="login-title">
+    <form id="login-form">
+      <h2 id="login-title">Enter the access code</h2>
+      <p>You'll find it at the top of the Oracle dashboard on the computer that runs Oracle, or by running <code>python3 oracle.py config</code> there.</p>
+      <label class="sr" for="login-code">Access code</label>
+      <input id="login-code" name="code" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="xxxx-xxxx" required>
+      <button class="primary" type="submit">Unlock</button>
+      <p class="login-err" id="login-err" role="alert"></p>
+    </form>
+  </section>
+
   <div id="banner"></div>
+  <div id="net"></div>
   <div class="summary" id="summary" aria-live="polite"></div>
   <main id="main"></main>
 
-  <footer>
+  <footer id="footer">
     Autostart decides which atlases start with Oracle. To start Oracle itself when you log in, run
     <code>python3 oracle.py autostart on</code>.
   </footer>
@@ -196,8 +223,26 @@
     const res = await fetch(path, opts);
     const isJson = (res.headers.get("Content-Type") || "").includes("json");
     const payload = isJson ? await res.json() : await res.text();
-    if (!res.ok) throw new Error((payload && payload.error) || res.statusText);
+    if (!res.ok) {
+      const err = new Error((payload && payload.error) || res.statusText);
+      err.status = res.status;
+      throw err;
+    }
     return payload;
+  }
+
+  // Atlases are opened on whatever address this page was opened with, so
+  // the links also work from a phone in LAN mode.
+  const atlasUrl = (port) => `${location.protocol}//${location.hostname.includes(":") && !location.hostname.startsWith("[") ? `[${location.hostname}]` : location.hostname}:${port}/`;
+
+  function lock(on) {
+    document.body.classList.toggle("locked", on);
+    if (on) {
+      last = "";
+      $("#folder").textContent = "locked";
+      $("#banner").innerHTML = "";
+      setTimeout(() => $("#login-code").focus(), 0);
+    }
   }
 
   function toast(text) {
@@ -220,7 +265,7 @@
     const live = a.state === "running" || a.state === "external";
     const busy = ["starting", "installing", "syncing"].includes(a.state);
     const btn = [];
-    if (live) btn.push(`<a class="btn primary" href="http://localhost:${a.port}/" target="_blank" rel="noopener">Open</a>`);
+    if (live) btn.push(`<a class="btn primary" href="${esc(atlasUrl(a.port))}" target="_blank" rel="noopener">Open</a>`);
     if (a.present && !live && !busy && a.state !== "error") btn.push(`<button class="primary" data-act="start" data-name="${esc(a.name)}">Start</button>`);
     if (a.state === "running" || a.state === "starting" || a.state === "installing") btn.push(`<button data-act="stop" data-name="${esc(a.name)}">Stop</button>`);
     if (a.state === "running" || a.state === "crashed") btn.push(`<button class="quiet" data-act="restart" data-name="${esc(a.name)}">Restart</button>`);
@@ -254,11 +299,18 @@
   }
 
   function render(d) {
-    const key = JSON.stringify(d.atlases.map(({ uptime, ...rest }) => ({ ...rest, up: rest.state === "running" ? Math.floor((uptime || 0) / 60) : 0 })).concat([d.db, d.lan_ip]));
+    const key = JSON.stringify(d.atlases.map(({ uptime, ...rest }) => ({ ...rest, up: rest.state === "running" ? Math.floor((uptime || 0) / 60) : 0 })).concat([d.db, d.lan_ip, d.client, d.remote_url, d.access_code]));
     if (key === last) return;
     last = key;
 
+    const local = d.client === "local";
     $("#folder").textContent = d.db;
+    $("#quit").hidden = !local;           // Oracle can only be quit on its own computer
+    $("#footer").hidden = !local;
+    $("#net").innerHTML = d.lan && local && d.remote_url
+      ? `<div class="netinfo"><span>Other devices on your network: <b>${esc(d.remote_url)}</b></span>
+           <span>Access code: <b>${esc(d.access_code || "not set")}</b></span></div>`
+      : "";
     const present = d.atlases.filter((a) => a.present);
     const missing = d.atlases.filter((a) => !a.present);
     const running = present.filter((a) => a.state === "running" || a.state === "external").length;
@@ -269,7 +321,6 @@
       `<span><b>${running}</b> of ${present.length} running</span>`,
       `<span><b>${auto}</b> start automatically</span>`,
       problems ? `<span style="color:var(--bad)"><b style="color:inherit">${problems}</b> need attention</span>` : "",
-      d.lan && d.lan_ip ? `<span>On your network: <b>http://${esc(d.lan_ip)}:&lt;port&gt;</b></span>` : "",
     ].join("");
 
     let html = "";
@@ -294,10 +345,17 @@
     try {
       data = await api("/api/status");
       if (!online) { online = true; $("#banner").innerHTML = ""; }
+      lock(false);
       render(data);
       if (logName) await loadLog();
       timer = setTimeout(refresh, 1500);
     } catch (e) {
+      if (e.status === 401) {               // another device that hasn't entered the code
+        if ($("#log").open) $("#log").close();
+        if (!document.body.classList.contains("locked")) lock(true);
+        timer = setTimeout(refresh, 15000);
+        return;
+      }
       if (online) {
         online = false;
         last = "";
@@ -313,7 +371,8 @@
       const d = await api(path, body);
       if (d && d.atlases) { data = d; render(d); }
     } catch (e) {
-      toast(e.message || "That didn't work.");
+      if (e.status === 401) lock(true);     // the code was changed meanwhile
+      else toast(e.message || "That didn't work.");
     }
     setTimeout(refresh, 400);
   }
@@ -359,6 +418,23 @@
   document.addEventListener("change", (ev) => {
     const s = ev.target.closest("[data-select]");
     if (s) act(`/api/atlas/${encodeURIComponent(s.dataset.select)}/select`, { selected: s.checked });
+  });
+
+  $("#login-form").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const btn = ev.target.querySelector("button");
+    btn.disabled = true;
+    $("#login-err").textContent = "";
+    try {
+      await api("/api/login", { code: $("#login-code").value });
+      $("#login-code").value = "";
+      await refresh();
+    } catch (e) {
+      $("#login-err").textContent = e.message || "That didn't work.";
+      $("#login-code").select();
+    } finally {
+      btn.disabled = false;
+    }
   });
 
   $("#log-close").addEventListener("click", () => $("#log").close());
