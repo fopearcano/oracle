@@ -307,9 +307,13 @@
     $("#folder").textContent = d.db;
     $("#quit").hidden = !local;           // Oracle can only be quit on its own computer
     $("#footer").hidden = !local;
+    const others = (d.lan_ips || []).filter((a) => a.ip !== d.lan_ip)
+      .map((a) => `${esc(a.ip)}${a.kind ? ` (${esc(a.kind)})` : ""}`);
     $("#net").innerHTML = d.lan && local && d.remote_url
       ? `<div class="netinfo"><span>Other devices on your network: <b>${esc(d.remote_url)}</b></span>
-           <span>Access code: <b>${esc(d.access_code || "not set")}</b></span></div>`
+           <span>Access code: <b>${esc(d.access_code || "not set")}</b></span>
+           ${others.length ? `<span>This computer's other addresses: ${others.join(", ")}</span>` : ""}
+           <span>Not loading on the phone? Run <code>python3 oracle.py doctor</code> here.</span></div>`
       : "";
     const present = d.atlases.filter((a) => a.present);
     const missing = d.atlases.filter((a) => !a.present);

@@ -15,6 +15,8 @@ them, and `oracle.py autostart on` makes it run every time you log in.
     python3 oracle.py config --lan on  open atlases + dashboard to your network
     python3 oracle.py autostart on     run Oracle when you log in
     python3 oracle.py stop             stop a running Oracle and its atlases
+    python3 oracle.py restart          restart it in the background (applies settings)
+    python3 oracle.py doctor [--fix]   why can't my phone reach it? (and fix the firewall)
 
 Only the Python standard library is used (Python 3.8 or newer). Atlases with
 a server of their own need Node.js; `sync` needs git.
@@ -29,8 +31,10 @@ import hmac
 import ipaddress
 import json
 import os
+import platform
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import socket
@@ -108,13 +112,122 @@ def port_open(port, host: str = "127.0.0.1") -> bool:
         return False
 
 
-def lan_ip():
+def run_quiet(cmd, timeout: float = 30) -> str:
+    """Output of a helper command, or "" when it is missing or fails."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                           timeout=timeout, stdin=subprocess.DEVNULL, **NO_WINDOW)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return (r.stdout or "") + (r.stderr or "")
+
+
+def wait_until(cond, timeout: float, step: float = 0.25) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        if cond():
+            return True
+        time.sleep(step)
+    return bool(cond())
+
+
+# ------------------------------------------------------------- addresses
+
+def route_ip():
+    """The address of the adapter that carries the default route."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("192.0.2.1", 9))   # no packet is sent; this only picks a route
             return s.getsockname()[0]
     except OSError:
         return None
+
+
+VPN_IF = re.compile(r"utun|^tun|^tap|^wg|^ppp|tailscale|zerotier|vpn|nord|proton|wireguard|"
+                    r"anyconnect|cisco|forti|pangp|globalprotect", re.I)
+VIRTUAL_IF = re.compile(r"docker|^br-|^veth|virbr|vbox|virtualbox|vmnet|vmware|vethernet|hyper-v|"
+                        r"wsl|^bridge\d|lxc|lxd|podman|^cni|flannel|parallels", re.I)
+
+
+def address_kind(name: str, ip: str) -> str:
+    """"" for a real Wi-Fi or Ethernet adapter, otherwise "VPN" or "virtual"."""
+    try:
+        if ipaddress.ip_address(ip) in CGNAT:
+            return "VPN"
+    except ValueError:
+        pass
+    if VPN_IF.search(name or ""):
+        return "VPN"
+    if VIRTUAL_IF.search(name or ""):
+        return "virtual"
+    return ""
+
+
+def parse_ip_addr(text: str) -> list:
+    """Linux `ip -4 -o addr show`."""
+    return re.findall(r"^\d+:\s+(\S+?)(?:@\S+)?\s+inet\s+([\d.]+)/", text, re.M)
+
+
+def parse_ifconfig(text: str) -> list:
+    """macOS `ifconfig`, and Linux net-tools."""
+    found, name = [], ""
+    for line in text.splitlines():
+        m = re.match(r"^(\S+?):?\s+(?:flags=|Link encap)", line)
+        if m:
+            name = m.group(1)
+        m = re.match(r"^\s+inet (?:addr:)?([\d.]+)", line)
+        if m:
+            found.append((name, m.group(1)))
+    return found
+
+
+def parse_ipconfig(text: str) -> list:
+    """Windows `ipconfig`, in any language (the address line always says IPv4)."""
+    found, name = [], ""
+    for line in text.splitlines():
+        if line and not line[0].isspace() and line.rstrip().endswith(":"):
+            name = line.strip().rstrip(":").strip()
+        elif "IPv4" in line:
+            m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", line)
+            if m:
+                found.append((name, m.group(1)))
+    return found
+
+
+_addresses = (0.0, [])
+
+
+def local_addresses(max_age: float = 30.0) -> list:
+    """[(adapter, ip, kind)] for this computer's private IPv4 addresses.
+
+    Real Wi-Fi/Ethernet adapters come first, the one with the default route
+    first of all; VPN and virtual adapters (Docker, WSL, VMs) come last.
+    """
+    global _addresses
+    if time.time() - _addresses[0] < max_age:
+        return _addresses[1]
+    if IS_WIN:
+        pairs = parse_ipconfig(run_quiet(["ipconfig"]))
+    else:
+        pairs = parse_ip_addr(run_quiet(["ip", "-4", "-o", "addr", "show"])) if shutil.which("ip") else []
+        if not pairs and shutil.which("ifconfig"):
+            pairs = parse_ifconfig(run_quiet(["ifconfig"]))
+    route = route_ip()
+    pairs = list(pairs) + [("", route or "")]
+    found, seen = [], set()
+    for name, ip in pairs:
+        if not ip or ip in seen or client_scope(ip) != "lan" or ipaddress.ip_address(ip).is_link_local:
+            continue
+        seen.add(ip)
+        found.append((name, ip, address_kind(name, ip)))
+    found.sort(key=lambda t: (t[2] != "", t[1] != route))
+    _addresses = (time.time(), found)
+    return found
+
+
+def best_lan_ip():
+    addrs = local_addresses()
+    return addrs[0][1] if addrs else route_ip()
 
 
 def spawn_flags() -> dict:
@@ -834,7 +947,9 @@ class Supervisor:
         return {
             "app": "oracle", "version": VERSION, "pid": os.getpid(),
             "db": str(self.db), "db_exists": self.db.is_dir(),
-            "lan": self.lan, "lan_ip": lan_ip() if self.lan else None,
+            "lan": self.lan, "lan_ip": best_lan_ip() if self.lan else None,
+            "lan_ips": [{"ip": ip, "adapter": name, "kind": kind} for name, ip, kind in local_addresses()]
+            if self.lan else [],
             "atlases": [r.info(self.is_selected(r.atlas.name)) for r in runners],
         }
 
@@ -846,7 +961,27 @@ class Server(ThreadingHTTPServer):
     allow_reuse_address = not IS_WIN    # on Windows it would let two servers share a port
 
 
-class StaticHandler(SimpleHTTPRequestHandler):
+class PlainHTTP:
+    """Mixin for Oracle's servers: hang up instead of hanging.
+
+    A browser that tries https:// first sends a TLS handshake, which an HTTP
+    server would sit on until the browser gives up. Closing it at once lets
+    the browser fall back to http:// straight away. Silent connections are
+    closed after a minute.
+    """
+
+    timeout = 60
+
+    def handle(self):
+        try:
+            first = self.connection.recv(1, socket.MSG_PEEK)
+        except OSError:
+            return
+        if first and first != b"\x16":          # 0x16 opens every TLS handshake
+            super().handle()
+
+
+class StaticHandler(PlainHTTP, SimpleHTTPRequestHandler):
     """Static files that the browser re-checks on every load (no stale scripts)."""
 
     extensions_map = {
@@ -877,7 +1012,7 @@ def serve_static(root: str, port: int, host: str) -> None:
             pass
 
 
-class DashboardHandler(BaseHTTPRequestHandler):
+class DashboardHandler(PlainHTTP, BaseHTTPRequestHandler):
     """The dashboard and its API.
 
     This computer may always use it. When LAN mode is on, devices on a private
@@ -1136,19 +1271,383 @@ def autostart_content() -> str:
 
 # ---------------------------------------------------------------- commands
 
+# ------------------------------------------------------------------- doctor
+#
+# `oracle.py doctor` explains why other devices can't reach Oracle, and
+# `doctor --fix` opens the firewall for it (after the system asks you).
+
+SOCKETFILTERFW = "/usr/libexec/ApplicationFirewall/socketfilterfw"
+WIN_RULE = "Oracle atlases"
+PRIVATE_NETS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+
+
+def is_wsl() -> bool:
+    return "microsoft" in platform.release().lower() or bool(os.environ.get("WSL_DISTRO_NAME"))
+
+
+def oracle_ports(cfg: dict, live) -> list:
+    """The dashboard's port and every atlas port, in use now or later."""
+    port = cfg.get("port") or DEFAULT_PORT
+    ports = {port}
+    if live:
+        ports.update(a["port"] for a in live.get("atlases", []) if a.get("port"))
+    else:
+        ports.update(a.port for a in scan(resolve_db(None, cfg), load_registry(), port).values() if a.port)
+    return sorted(int(p) for p in ports)
+
+
+def mac_python_binary() -> str:
+    """The binary macOS's firewall sees when Python listens (Python.app in framework builds)."""
+    out = run_quiet(["ps", "-o", "comm=", "-p", str(os.getpid())]).strip()
+    if out.startswith("/") and os.path.exists(out):
+        return out
+    real = os.path.realpath(sys.executable)
+    m = re.match(r"(.*/Python3?\.framework/Versions/[^/]+)/", real)
+    if m:
+        app = os.path.join(m.group(1), "Resources", "Python.app", "Contents", "MacOS", "Python")
+        if os.path.exists(app):
+            return app
+    return real
+
+
+def firewall_programs() -> list:
+    """[(label, path)] of the programs that listen for Oracle: Python and Node.js."""
+    if sys.platform == "darwin":
+        progs = [("Python", mac_python_binary())]
+    else:
+        progs = [("Python", os.path.realpath(sys.executable))]
+    if IS_WIN:
+        for exe in ("python.exe", "pythonw.exe"):
+            cand = str(Path(sys.executable).with_name(exe))
+            if os.path.exists(cand) and all(os.path.normcase(cand) != os.path.normcase(p) for _, p in progs):
+                progs.append((exe, cand))
+    node = shutil.which("node")
+    if node:
+        progs.append(("Node.js", os.path.realpath(node)))
+    return progs
+
+
+class Report:
+    """What the doctor found: rows to print, things to do, and an optional fix."""
+
+    def __init__(self):
+        self.rows, self.todo = [], []
+        self.fix_plan, self.fix = [], None
+
+    def row(self, mark: str, label: str, text: str) -> None:
+        self.rows.append((mark, label, text))
+
+
+def check_mac_firewall(rep: Report, ports: list) -> None:
+    if not os.path.exists(SOCKETFILTERFW):
+        return rep.row("?", "Firewall", "couldn't check it")
+    state = run_quiet([SOCKETFILTERFW, "--getglobalstate"]).lower()
+    if "disabled" in state or "state = 0" in state:
+        return rep.row("ok", "Firewall", "off")
+    rep.row("", "Firewall", "on")
+    if "state = 2" in state or "enabled" in run_quiet([SOCKETFILTERFW, "--getblockall"]).lower():
+        rep.row("!!", "", "'Block all incoming connections' is on")
+        rep.todo.append(("The Mac firewall blocks every incoming connection.",
+                         "System Settings > Network > Firewall > Options: turn off "
+                         "'Block all incoming connections'."))
+    cmds = []
+    for label, path in firewall_programs():
+        out = " ".join(run_quiet([SOCKETFILTERFW, "--getappblocked", path]).split())
+        low = out.lower()
+        if "not part" in low:
+            mark, verdict = "?", "not on the firewall's list, so macOS may block it"
+        elif "permit" in low or "allow" in low or "not blocked" in low:
+            mark, verdict = "ok", "allowed"
+        elif "block" in low:
+            mark, verdict = "!!", "blocked"
+        else:
+            mark, verdict = "?", out or "unknown"
+        rep.row(mark, "", f"{label}: {verdict}  ({path})")
+        if mark != "ok":
+            cmds += [["sudo", SOCKETFILTERFW, "--add", path], ["sudo", SOCKETFILTERFW, "--unblockapp", path]]
+    if cmds:
+        rep.todo.append(("The Mac firewall may be blocking Python or Node.js.",
+                         "python3 oracle.py doctor --fix   (it asks for your Mac password)"))
+        rep.fix_plan = [" ".join(shlex.quote(c) for c in cmd) for cmd in cmds]
+        rep.fix = lambda: run_interactive(cmds)
+
+
+def run_interactive(cmds: list) -> bool:
+    ok = True
+    for cmd in cmds:
+        print("  $ " + " ".join(shlex.quote(c) for c in cmd), flush=True)
+        try:
+            ok = subprocess.run(cmd).returncode == 0 and ok
+        except OSError as e:
+            print(f"    failed: {e}")
+            ok = False
+    return ok
+
+
+WIN_CHECK = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+Get-NetConnectionProfile | ForEach-Object { 'PROFILE|' + $_.InterfaceAlias + '|' + $_.NetworkCategory }
+Get-NetFirewallProfile | ForEach-Object { 'FW|' + $_.Name + '|' + $_.Enabled }
+Get-NetFirewallApplicationFilter | Where-Object { $_.Program -match 'python|node' } | ForEach-Object {
+  $r = $_ | Get-NetFirewallRule
+  if ($r.Direction -eq 'Inbound' -and $r.Enabled -eq 'True') { 'APP|' + $r.Action + '|' + $r.Profile + '|' + $_.Program }
+}
+Get-NetFirewallRule -DisplayName '%s' | ForEach-Object {
+  $p = $_ | Get-NetFirewallPortFilter
+  'ORACLE|' + $_.Enabled + '|' + $_.Profile + '|' + ($p.LocalPort -join ',')
+}
+""" % WIN_RULE
+
+
+def parse_windows_firewall(text: str) -> dict:
+    info = {"networks": [], "enabled": {}, "apps": [], "rule": None}
+    for line in text.splitlines():
+        parts = line.strip().split("|")
+        if parts[0] == "PROFILE" and len(parts) >= 3:
+            info["networks"].append((parts[1], parts[2]))
+        elif parts[0] == "FW" and len(parts) >= 3:
+            info["enabled"][parts[1]] = parts[2] == "True"
+        elif parts[0] == "APP" and len(parts) >= 4:
+            info["apps"].append((parts[1], parts[2], "|".join(parts[3:])))
+        elif parts[0] == "ORACLE" and len(parts) >= 4:
+            ports = {int(p) for p in re.findall(r"\d+", parts[3])}
+            info["rule"] = (parts[1] == "True", parts[2], ports)
+    return info
+
+
+def check_windows_firewall(rep: Report, ports: list, text=None) -> None:
+    if text is None:
+        ps = shutil.which("powershell") or shutil.which("pwsh")
+        text = run_quiet([ps, "-NoProfile", "-NonInteractive", "-Command", WIN_CHECK], timeout=120) if ps else ""
+    info = parse_windows_firewall(text)
+    if not info["networks"] and not info["enabled"]:
+        rep.row("?", "Firewall", "couldn't read the Windows Firewall settings")
+    profile_of = {"Public": "Public", "Private": "Private", "DomainAuthenticated": "Domain"}
+    active = {profile_of.get(cat, cat) for _, cat in info["networks"]} or {"Private", "Public"}
+    for alias, cat in info["networks"]:
+        if cat == "Public":
+            rep.row("!!", "Network", f"'{alias}' is set to Public, so Windows blocks incoming connections on it")
+            rep.todo.append((f"Windows treats the network '{alias}' as Public.",
+                             f"If it's your home network: Settings > Network & internet > {alias} > "
+                             "Network profile type: Private."))
+        else:
+            rep.row("ok", "Network", f"'{alias}' is {cat}")
+    if info["enabled"] and not any(info["enabled"].get(p) for p in active):
+        return rep.row("ok", "Firewall", "off for this network")
+    rep.row("", "Firewall", "on")
+
+    def covers(profile: str) -> bool:
+        return "Any" in profile or "All" in profile or any(p in profile for p in active)
+
+    ours = {os.path.normcase(p): label for label, p in firewall_programs()}
+    blocked = [(ours[os.path.normcase(os.path.expandvars(prog))], prog) for action, profile, prog in info["apps"]
+               if action == "Block" and covers(profile) and os.path.normcase(os.path.expandvars(prog)) in ours]
+    for label, prog in blocked:
+        rep.row("!!", "", f"{label} is blocked by a firewall rule ({prog})")
+    allowed = {os.path.normcase(os.path.expandvars(prog)) for action, profile, prog in info["apps"]
+               if action == "Allow" and covers(profile)}
+    rule = info["rule"]
+    rule_ok = bool(rule and rule[0] and covers(rule[1]) and set(ports) <= rule[2])
+    apps_ok = all(p in allowed for p in ours)
+    if rule_ok:
+        rep.row("ok", "", f"the '{WIN_RULE}' rule lets the ports in")
+    elif apps_ok:
+        rep.row("ok", "", "Python and Node.js are allowed")
+    else:
+        rep.row("!!", "", "nothing lets Oracle's ports in yet")
+    if blocked or not (rule_ok or apps_ok):
+        rep.todo.append(("Windows Firewall blocks Oracle.",
+                         "python3 oracle.py doctor --fix   (Windows asks for permission)"))
+        rep.fix_plan = [f"add the firewall rule '{WIN_RULE}' for TCP ports {', '.join(map(str, ports))} "
+                        "(Private and Domain networks only)"]
+        if blocked:
+            rep.fix_plan.append("remove the rules that block " + " and ".join(sorted({b[0] for b in blocked})))
+        rep.fix = lambda: fix_windows_firewall(ports, [p for _, p in firewall_programs()])
+
+
+def fix_windows_firewall(ports: list, programs: list) -> bool:
+    def ps_str(s: str) -> str:
+        return "'" + s.replace("'", "''") + "'"
+    script = "\r\n".join([
+        "$ErrorActionPreference = 'Continue'",
+        f"Remove-NetFirewallRule -DisplayName {ps_str(WIN_RULE)} -ErrorAction SilentlyContinue",
+        f"New-NetFirewallRule -DisplayName {ps_str(WIN_RULE)} -Direction Inbound -Action Allow -Protocol TCP "
+        f"-LocalPort {','.join(map(str, ports))} -Profile Private,Domain | Out-Null",
+        "$targets = @(" + ",".join(ps_str(p) for p in programs) + ")",
+        "Get-NetFirewallApplicationFilter | Where-Object { $targets -contains "
+        "[Environment]::ExpandEnvironmentVariables($_.Program) } | Get-NetFirewallRule | "
+        "Where-Object { $_.Direction -eq 'Inbound' -and $_.Action -eq 'Block' } | Remove-NetFirewallRule",
+        "Write-Host 'Done.'",
+        "Start-Sleep -Seconds 2",
+    ]) + "\r\n"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    path = LOG_DIR / "fix-firewall.ps1"
+    path.write_text(script, encoding="utf-8-sig")
+    ps = shutil.which("powershell") or "powershell"
+    inner = f"-NoProfile -ExecutionPolicy Bypass -File \"{path}\""
+    cmd = [ps, "-NoProfile", "-Command",
+           f"Start-Process {ps_str(ps)} -Verb RunAs -Wait -ArgumentList {ps_str(inner)}"]
+    print(f"  Running {path} as administrator...", flush=True)
+    return subprocess.run(cmd).returncode == 0
+
+
+def check_linux_firewall(rep: Report, ports: list) -> None:
+    ufw = shutil.which("ufw") and "ENABLED=yes" in read_text(Path("/etc/ufw/ufw.conf"))
+    firewalld = shutil.which("firewall-cmd") and run_quiet(["firewall-cmd", "--state"]).strip() == "running"
+    if not ufw and not firewalld:
+        return rep.row("ok", "Firewall", "neither ufw nor firewalld is on")
+    cmds = []
+    if ufw:
+        rep.row("?", "Firewall", "ufw is on (it blocks incoming connections unless a rule allows them)")
+        for start in range(0, len(ports), 15):            # ufw takes 15 ports per rule
+            chunk = ",".join(map(str, ports[start:start + 15]))
+            cmds += [["sudo", "ufw", "allow", "proto", "tcp", "from", net, "to", "any", "port", chunk]
+                     for net in PRIVATE_NETS]
+    if firewalld:
+        rep.row("?", "Firewall", "firewalld is running")
+        cmds.append(["sudo", "firewall-cmd", "--permanent"] + [f"--add-port={p}/tcp" for p in ports])
+        cmds.append(["sudo", "firewall-cmd", "--reload"])
+    rep.todo.append(("The Linux firewall probably blocks Oracle's ports.",
+                     "python3 oracle.py doctor --fix   (it asks for your password)"))
+    rep.fix_plan = [" ".join(shlex.quote(c) for c in cmd) for cmd in cmds]
+    rep.fix = lambda: run_interactive(cmds)
+
+
+def check_wsl(rep: Report) -> None:
+    rep.row("!!", "WSL", "Oracle runs inside WSL, whose network is hidden behind Windows")
+    rep.todo.append((
+        "Other devices can't reach programs inside WSL (only Windows itself can).",
+        "Easiest: run Oracle with Windows' own Python instead (double-click start-oracle.bat).\n"
+        "     Or, on Windows 11, put these two lines in C:\\Users\\<you>\\.wslconfig, run `wsl --shutdown`\n"
+        "     in Windows and start WSL again:\n"
+        "         [wsl2]\n"
+        "         networkingMode=mirrored\n"
+        "     Then let the ports in, in an administrator PowerShell on Windows:\n"
+        "         Set-NetFirewallHyperVVMSetting -Name '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' "
+        "-DefaultInboundAction Allow"))
+
+
+def cmd_doctor(args) -> int:
+    cfg = load_config()
+    port = cfg.get("port") or DEFAULT_PORT
+    live = call_oracle(port, "/api/status")
+    ports = oracle_ports(cfg, live)
+    rep = Report()
+
+    # 1. Is the running Oracle open to the network at all?
+    if live is None:
+        rep.row("--", "Oracle", f"not running (dashboard port {port})")
+        rep.todo.append(("Oracle isn't running.", "python3 oracle.py restart" if cfg.get("lan")
+                         else "python3 oracle.py config --lan on\n     python3 oracle.py restart"))
+    elif not live.get("lan"):
+        rep.row("!!", "Oracle", "running, but only for this computer: LAN mode is off in the running Oracle")
+        if cfg.get("lan"):
+            rep.todo.append(("LAN mode was turned on after Oracle started, so the running Oracle is still private.",
+                             "python3 oracle.py restart"))
+        else:
+            rep.todo.append(("LAN mode is off.", "python3 oracle.py config --lan on\n     python3 oracle.py restart"))
+    else:
+        rep.row("ok", "Oracle", f"running in LAN mode, dashboard port {port}")
+
+    system = platform.system()
+    if sys.platform == "darwin":
+        system = f"macOS {platform.mac_ver()[0]}"
+    elif IS_WIN:
+        system = f"Windows {platform.release()}"
+    rep.row("", "System", system + (" (WSL)" if is_wsl() else ""))
+
+    # 2. Which address should other devices use?
+    addrs = local_addresses(max_age=0)
+    best = addrs[0][1] if addrs else None
+    if not addrs:
+        rep.row("!!", "Address", "no private network address: is this computer on Wi-Fi or Ethernet?")
+        rep.todo.append(("This computer has no address on a local network.", "Connect it to your Wi-Fi or router."))
+    for i, (name, ip, kind) in enumerate(addrs):
+        note = "  <- other devices use this one" if i == 0 else (
+            f"  ({kind}: other devices on your Wi-Fi can't use it)" if kind else "")
+        rep.row("", "Address" if i == 0 else "", f"{ip:<15} {name or '(adapter unknown)'}{note}")
+    if addrs and addrs[0][2]:
+        rep.todo.append((f"The only address found is a {addrs[0][2]} one ({best}).",
+                         "Connect this computer to the same Wi-Fi as the phone, or turn the VPN off."))
+
+    # 3. Do Oracle's servers answer on that address? (Tested from this computer,
+    #    which the firewall doesn't filter, so this checks only how they listen.)
+    if live and live.get("lan") and best:
+        checks = [("dashboard", port)] + [(a["name"], a["port"]) for a in live.get("atlases", [])
+                                          if a.get("state") in ("running", "external")]
+        closed = [f"{name} ({p})" for name, p in checks if not port_open(p, best)]
+        if closed:
+            rep.row("!!", "Listening", f"not on {best}: " + ", ".join(closed))
+            rep.todo.append(("Some servers listen on this computer only.",
+                             "Those shown as 'Already running' were started outside Oracle: stop them, then\n"
+                             "     start them from the dashboard (or run: python3 oracle.py restart)."))
+        else:
+            rep.row("ok", "Listening", f"all {len(checks)} servers answer on {best}")
+
+    # 4. The firewall.
+    if is_wsl():
+        check_wsl(rep)
+    elif sys.platform == "darwin":
+        check_mac_firewall(rep, ports)
+    elif IS_WIN:
+        check_windows_firewall(rep, ports)
+    else:
+        check_linux_firewall(rep, ports)
+
+    print("\nOracle network check\n")
+    for mark, label, text in rep.rows:
+        print(f"  {mark:<3}{label:<10} {text}")
+
+    if args.fix:
+        print()
+        if not rep.fix:
+            say("Nothing to change in the firewall.")
+        else:
+            say("Changing the firewall:")
+            for line in rep.fix_plan:
+                print(f"    {line}")
+            if rep.fix():
+                say("Done. Now restart Oracle (python3 oracle.py restart) and try the other device again.")
+            else:
+                say("That didn't fully work; see the messages above.")
+        return 0
+
+    if rep.todo:
+        print("\nWhat to do\n")
+        for i, (problem, fix) in enumerate(rep.todo, 1):
+            print(f"  {i}. {problem}\n     {fix}")
+    else:
+        print("\nThis computer looks ready.")
+    url = f"http://{best}:{port}" if best else f"http://<this computer's address>:{port}"
+    code = cfg.get("access_code") or "(made when you turn LAN mode on)"
+    print(f"""
+On the phone or other device
+  - Open {url}  (type http://, not https://) and enter the access code {code}
+  - It must be on the same Wi-Fi as this computer: not on mobile data and not on a guest network.
+  - Some routers keep Wi-Fi devices apart ("AP isolation" or "client isolation"). If everything
+    above is fine and it still doesn't load, turn that off in the router's settings.
+  - Turn off any VPN on that device while you try.
+""")
+    return 1 if rep.todo else 0
+
+
 def cmd_start(args) -> int:
     cfg = load_config()
     db = resolve_db(args.db, cfg)
     port = args.port or cfg.get("port") or DEFAULT_PORT
     url = f"http://localhost:{port}"
 
-    if call_oracle(port, "/api/status"):
+    lan = bool(args.lan or cfg.get("lan"))
+    live = call_oracle(port, "/api/status")
+    if live:
         say(f"Oracle is already running: {url}")
+        if bool(live.get("lan")) != lan:
+            say(f"But it runs {'without' if lan else 'with'} LAN mode: it was started before that setting changed.")
+            say("Restart it to apply the setting:  python3 oracle.py restart")
         if not args.no_browser:
             webbrowser.open(url)
         return 0
 
-    lan = bool(args.lan or cfg.get("lan"))
     if lan and ensure_access_code(cfg):
         save_config(cfg)
     host = "0.0.0.0" if lan else "127.0.0.1"
@@ -1176,7 +1675,7 @@ def cmd_start(args) -> int:
     sup.start(names)
     say(f"Dashboard: {url}   (Ctrl+C stops Oracle and every atlas it started)")
     if lan:
-        where = lan_ip() or "this-computer"
+        where = best_lan_ip() or "this-computer"
         say(f"On your network: dashboard http://{where}:{port} (access code {cfg['access_code']}),")
         say(f"                 atlases http://{where}:<port>")
     if not args.no_browser:
@@ -1249,7 +1748,7 @@ def cmd_select(args, selected: bool) -> int:
     chosen = [n for n in known if n not in skip]
     say("Starts automatically: " + (", ".join(chosen) if chosen else "nothing"))
     if call_oracle(cfg.get("port") or DEFAULT_PORT, "/api/status"):
-        say("Oracle is running: restart it (or use the dashboard) for this to take effect now.")
+        say("Oracle is running: use the dashboard, or `python3 oracle.py restart`, for this to take effect now.")
     return 0
 
 
@@ -1272,6 +1771,51 @@ def cmd_sync(args) -> int:
     if failed:
         say(f"{failed} could not be synced.")
     return 1 if failed else 0
+
+
+def spawn_background(argv: list) -> None:
+    """Start `oracle.py <argv>` detached from this terminal, logging to logs/oracle.log."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log = open(LOG_DIR / "oracle.log", "ab")
+    exe = sys.executable
+    kwargs = {"start_new_session": True}
+    if IS_WIN:
+        pyw = Path(exe).with_name("pythonw.exe")
+        exe = str(pyw) if pyw.exists() else exe
+        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+        kwargs = {"creationflags": 0x00000008 | 0x00000200 | 0x08000000}
+    try:
+        subprocess.Popen([exe, str(HERE / "oracle.py")] + argv, cwd=str(HERE), stdin=subprocess.DEVNULL,
+                         stdout=log, stderr=subprocess.STDOUT, close_fds=True, **kwargs)
+    finally:
+        log.close()
+
+
+def cmd_restart(args) -> int:
+    cfg = load_config()
+    port = args.port or cfg.get("port") or DEFAULT_PORT
+    url = f"http://localhost:{port}"
+    if call_oracle(port, "/api/status"):
+        say("Stopping the running Oracle and its atlases...")
+        call_oracle(port, "/api/shutdown", post=True)
+        if not wait_until(lambda: not port_open(port), 90):
+            say(f"It is still running after 90 seconds. Stop it with Ctrl+C where it runs, then try again.")
+            return 1
+    elif port_open(port):
+        say(f"Port {port} is used by another program, not by Oracle.")
+        return 1
+    argv = ["start", "--no-browser"] + (["--port", str(args.port)] if args.port else []) + (["--lan"] if args.lan else [])
+    spawn_background(argv)
+    if not wait_until(lambda: call_oracle(port, "/api/status") is not None, 30):
+        say(f"Oracle did not come back up. See {LOG_DIR / 'oracle.log'}")
+        return 1
+    live = call_oracle(port, "/api/status") or {}
+    say(f"Oracle is running in the background: {url}   (stop it with: python3 oracle.py stop)")
+    if live.get("lan"):
+        say(f"On your network: {live.get('remote_url')}   access code {live.get('access_code')}")
+    if not args.no_browser:
+        webbrowser.open(url)
+    return 0
 
 
 def cmd_stop(args) -> int:
@@ -1311,13 +1855,13 @@ def cmd_config(args) -> int:
     shown = {k: v for k, v in cfg.items() if k != "session_secret"}
     print(json.dumps({**shown, "db (resolved)": str(resolve_db(None, cfg))}, indent=2))
     if cfg["lan"]:
-        say(f"Other devices open the dashboard at http://{lan_ip() or 'this-computer'}:{cfg['port']}"
+        say(f"Other devices open the dashboard at http://{best_lan_ip() or 'this-computer'}:{cfg['port']}"
             f" and enter the access code {cfg['access_code']}")
     if args.code is not None or args.new_code:
         say("Devices that used the old code will be asked for the new one.")
     if args.lan is not None or args.port is not None or args.db is not None:
         if call_oracle(cfg.get("port") or DEFAULT_PORT, "/api/status"):
-            say("Oracle is running: restart it for this to take effect.")
+            say("Oracle is running with the old setting. Apply it with:  python3 oracle.py restart")
     return 0
 
 
@@ -1375,6 +1919,14 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("stop", help="stop a running Oracle and its atlases")
     s.add_argument("--port", type=int)
 
+    s = sub.add_parser("restart", help="restart Oracle in the background, applying changed settings")
+    s.add_argument("--port", type=int, help="dashboard port")
+    s.add_argument("--lan", action="store_true", help="LAN mode for this run, even if it is off in the settings")
+    s.add_argument("--no-browser", action="store_true", help="don't open the dashboard in a browser")
+
+    s = sub.add_parser("doctor", help="find out why other devices can't reach Oracle")
+    s.add_argument("--fix", action="store_true", help="let Oracle through the firewall (asks for permission)")
+
     s = sub.add_parser("config", help="show or change the saved settings")
     s.add_argument("--db", metavar="DIR", help="folder that holds the atlases ('' resets it)")
     s.add_argument("--port", type=int, help="dashboard port")
@@ -1412,6 +1964,7 @@ def main(argv=None) -> int:
         return 0
     handlers = {
         "start": cmd_start, "list": cmd_list, "sync": cmd_sync, "stop": cmd_stop,
+        "restart": cmd_restart, "doctor": cmd_doctor,
         "config": cmd_config, "autostart": cmd_autostart,
         "select": lambda a: cmd_select(a, True), "deselect": lambda a: cmd_select(a, False),
     }

@@ -133,7 +133,13 @@ By default, the atlases and the dashboard listen on this computer only. To open 
 python3 oracle.py config --lan on
 ```
 
-Then restart Oracle. To try it for one run without saving the setting, use `python3 oracle.py --lan`.
+Then apply it to the Oracle that is already running (this also works when Oracle was started at login):
+
+```bash
+python3 oracle.py restart
+```
+
+To try LAN mode for one run without saving the setting, use `python3 oracle.py restart --lan`.
 
 - **Access code.** Oracle makes one up, such as `k7mp-q2xa`. The dashboard on this computer shows it at the top, together with the address other devices should open, and `python3 oracle.py config` prints it too.
 - **On the phone**, open that address (for example `http://192.168.1.20:8800`) and enter the code once. The phone then stays signed in for 30 days. Capital letters, spaces and dashes in the code don't matter.
@@ -144,6 +150,22 @@ Then restart Oracle. To try it for one run without saving the setting, use `pyth
 - **The atlases themselves have no code.** With LAN mode on, anyone on the network can open them. The writing tools keep their own protections. Dialogue Devil can ask for its own code if you set `DD_ACCESS_CODE`, and CharBuild lets only this computer change its AI settings. Story Builder lets anyone who reaches it use an API key set on the server, such as `ANTHROPIC_API_KEY`.
 - **Firewall:** the first time, macOS or Windows may ask whether Python or Node may accept incoming connections. Allow it, or other devices won't get through.
 
+### It works on this computer but not on the phone
+
+If the page on the phone keeps loading, or says it can't connect, run this on the computer that runs Oracle:
+
+```bash
+python3 oracle.py doctor
+```
+
+It checks the usual causes and tells you what to do about each one:
+
+- **Oracle is still private.** If Oracle was already running when you turned LAN mode on (for example, because it starts at login), it keeps listening on this computer only. Running `python3 oracle.py` again just reopens it. `python3 oracle.py restart` fixes that.
+- **The firewall.** This is the most common cause. On Windows, it blocks everything on networks marked *Public*, and it remembers a cancelled "allow access" prompt as a block. On macOS, it can block Python or Node.js without asking. `python3 oracle.py doctor --fix` lets Oracle's ports through. Your system asks for your password or for administrator permission first. On Windows the rule only applies to Private networks, so mark your home Wi-Fi as Private.
+- **The wrong address.** VPNs, Docker and virtual machines add extra addresses. The doctor lists them all and marks the one to open on the phone.
+- **WSL.** Oracle running inside WSL can't be reached from other devices. Run it with Windows' own Python instead, by double-clicking `start-oracle.bat`.
+- **The phone's side.** The phone must be on the same Wi-Fi, not on mobile data or a guest network, and without a VPN. Some routers keep Wi-Fi devices from seeing each other (*AP isolation* or *client isolation*).
+
 ## Commands
 
 | Command | What it does |
@@ -153,6 +175,8 @@ Then restart Oracle. To try it for one run without saving the setting, use `pyth
 | `oracle.py select NAME…` / `deselect NAME…` | Turn autostart on or off for these atlases (`--all` for every one) |
 | `oracle.py sync [NAME…]` | Clone missing atlases from GitHub and fast-forward the others (`--selected` for only the selected ones) |
 | `oracle.py stop` | Stop a running Oracle and every atlas it started |
+| `oracle.py restart` | Restart Oracle in the background, applying changed settings (`--lan`, `--port N`, `--no-browser`) |
+| `oracle.py doctor` | Find out why other devices can't reach Oracle; `--fix` lets it through the firewall |
 | `oracle.py config` | Show the settings, or change them with `--db DIR`, `--port N`, `--lan on/off`, `--code CODE`, `--new-code` |
 | `oracle.py autostart on/off/status` | Start Oracle at login |
 

@@ -434,6 +434,192 @@ class RemoteDashboardTest(TempDirCase):
         self.assertTrue(data["remote_url"].endswith(f":{self.port}"))
 
 
+IP_ADDR = """1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever
+2: wlp3s0    inet 192.168.1.20/24 brd 192.168.1.255 scope global dynamic wlp3s0\\       valid_lft 80000sec
+3: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\\       valid_lft forever
+4: tailscale0    inet 100.101.2.3/32 scope global tailscale0\\       valid_lft forever
+"""
+
+IFCONFIG_MAC = """lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+\tinet 127.0.0.1 netmask 0xff000000
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tether a4:83:e7:00:00:00
+\tinet 192.168.1.20 netmask 0xffffff00 broadcast 192.168.1.255
+utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
+\tinet 10.8.0.2 --> 10.8.0.2 netmask 0xffffffff
+"""
+
+IPCONFIG_IT = """
+Configurazione IP di Windows
+
+Scheda Ethernet vEthernet (WSL (Hyper-V firewall)):
+
+   Suffisso DNS specifico per connessione:
+   Indirizzo IPv4. . . . . . . . . . . . : 172.28.112.1
+   Subnet mask . . . . . . . . . . . . . : 255.255.240.0
+
+Scheda LAN wireless Wi-Fi:
+
+   Suffisso DNS specifico per connessione: home
+   Indirizzo IPv4. . . . . . . . . . . . : 192.168.1.20
+   Gateway predefinito . . . . . . . . . : 192.168.1.1
+"""
+
+
+class AddressTest(unittest.TestCase):
+    def setUp(self):
+        oracle._addresses = (0.0, [])
+
+    def test_parsers(self):
+        self.assertIn(("wlp3s0", "192.168.1.20"), oracle.parse_ip_addr(IP_ADDR))
+        self.assertIn(("en0", "192.168.1.20"), oracle.parse_ifconfig(IFCONFIG_MAC))
+        self.assertIn(("utun4", "10.8.0.2"), oracle.parse_ifconfig(IFCONFIG_MAC))
+        self.assertEqual(oracle.parse_ipconfig(IPCONFIG_IT),
+                         [("Scheda Ethernet vEthernet (WSL (Hyper-V firewall))", "172.28.112.1"),
+                          ("Scheda LAN wireless Wi-Fi", "192.168.1.20")])
+
+    def test_kinds(self):
+        self.assertEqual(oracle.address_kind("en0", "192.168.1.20"), "")
+        self.assertEqual(oracle.address_kind("utun4", "10.8.0.2"), "VPN")
+        self.assertEqual(oracle.address_kind("tailscale0", "100.101.2.3"), "VPN")
+        self.assertEqual(oracle.address_kind("docker0", "172.17.0.1"), "virtual")
+        self.assertEqual(oracle.address_kind("Scheda Ethernet vEthernet (WSL)", "172.28.112.1"), "virtual")
+
+    def test_real_adapter_wins_even_when_a_vpn_has_the_default_route(self):
+        with mock.patch.object(oracle, "IS_WIN", False), \
+             mock.patch.object(oracle.shutil, "which", side_effect=lambda n: "/sbin/ip" if n == "ip" else None), \
+             mock.patch.object(oracle, "run_quiet", return_value=IP_ADDR), \
+             mock.patch.object(oracle, "route_ip", return_value="100.101.2.3"):
+            addrs = oracle.local_addresses(max_age=0)
+        self.assertEqual([ip for _, ip, _ in addrs], ["192.168.1.20", "100.101.2.3", "172.17.0.1"])
+        self.assertEqual(oracle.best_lan_ip(), "192.168.1.20")
+
+    def test_windows_wsl_adapter_goes_last(self):
+        with mock.patch.object(oracle, "IS_WIN", True), \
+             mock.patch.object(oracle, "run_quiet", return_value=IPCONFIG_IT), \
+             mock.patch.object(oracle, "route_ip", return_value="192.168.1.20"):
+            addrs = oracle.local_addresses(max_age=0)
+        self.assertEqual(addrs[0][1], "192.168.1.20")
+        self.assertEqual(addrs[1][2], "virtual")
+
+
+WIN_PUBLIC_BLOCKED = """PROFILE|Wi-Fi|Public
+FW|Domain|True
+FW|Private|True
+FW|Public|True
+APP|Block|Public|C:\\Python312\\python.exe
+APP|Allow|Private|%ProgramFiles%\\nodejs\\node.exe
+"""
+
+
+class FirewallTest(TempDirCase):
+    def test_windows_public_network_and_block_rule(self):
+        programs = [("Python", "C:\\Python312\\python.exe"), ("Node.js", "C:\\Program Files\\nodejs\\node.exe")]
+        rep = oracle.Report()
+        with mock.patch.object(oracle, "firewall_programs", return_value=programs), \
+             mock.patch.dict(os.environ, {"ProgramFiles": "C:\\Program Files"}):
+            oracle.check_windows_firewall(rep, [8800, 8010], text=WIN_PUBLIC_BLOCKED)
+        texts = " ".join(t for _, _, t in rep.rows)
+        self.assertIn("'Wi-Fi' is set to Public", texts)
+        self.assertIn("Python is blocked", texts)
+        self.assertIsNotNone(rep.fix)
+        self.assertIn("8800, 8010", rep.fix_plan[0])
+        self.assertTrue(any("Public" in problem for problem, _ in rep.todo))
+
+    def test_windows_rule_already_there(self):
+        text = "PROFILE|Wi-Fi|Private\nFW|Private|True\nORACLE|True|Private, Domain|8800,8010,4135\n"
+        rep = oracle.Report()
+        with mock.patch.object(oracle, "firewall_programs", return_value=[("Python", "C:\\py\\python.exe")]):
+            oracle.check_windows_firewall(rep, [8800, 8010], text=text)
+        self.assertIsNone(rep.fix)
+        self.assertEqual(rep.todo, [])
+
+    def test_windows_firewall_off(self):
+        rep = oracle.Report()
+        oracle.check_windows_firewall(rep, [8800], text="PROFILE|Wi-Fi|Private\nFW|Private|False\n")
+        self.assertIn(("ok", "Firewall", "off for this network"), rep.rows)
+        self.assertIsNone(rep.fix)
+
+    def test_mac_blocked_python(self):
+        answers = {"--getglobalstate": "Firewall is enabled. (State = 1)",
+                   "--getblockall": "Firewall has block all state set to disabled.",
+                   "--getappblocked": "The application /fw/Python is blocked from incoming connections."}
+        rep = oracle.Report()
+        with mock.patch.object(oracle.os.path, "exists", return_value=True), \
+             mock.patch.object(oracle, "run_quiet", side_effect=lambda cmd, **kw: answers[cmd[1]]), \
+             mock.patch.object(oracle, "firewall_programs", return_value=[("Python", "/fw/Python")]):
+            oracle.check_mac_firewall(rep, [8800])
+        self.assertIn(("!!", "", "Python: blocked  (/fw/Python)"), rep.rows)
+        self.assertIn("--unblockapp", rep.fix_plan[1])
+
+    def test_mac_firewall_off(self):
+        rep = oracle.Report()
+        with mock.patch.object(oracle.os.path, "exists", return_value=True), \
+             mock.patch.object(oracle, "run_quiet", return_value="Firewall is disabled. (State = 0)"):
+            oracle.check_mac_firewall(rep, [8800])
+        self.assertEqual(rep.rows, [("ok", "Firewall", "off")])
+
+    def test_linux_ufw_rules_stay_on_private_networks(self):
+        rep = oracle.Report()
+        ports = list(range(8000, 8020))                     # more than ufw's 15 per rule
+        with mock.patch.object(oracle.shutil, "which", side_effect=lambda n: "/usr/sbin/ufw" if n == "ufw" else None), \
+             mock.patch.object(oracle, "read_text", return_value="ENABLED=yes\n"):
+            oracle.check_linux_firewall(rep, ports)
+        self.assertEqual(len(rep.fix_plan), 6)              # 2 chunks x 3 private ranges
+        self.assertTrue(all(" from 10.0.0.0/8 " in p or " from 172.16.0.0/12 " in p or " from 192.168.0.0/16 " in p
+                            for p in rep.fix_plan))
+
+
+class DoctorTest(TempDirCase):
+    def test_lan_turned_on_after_start_says_restart(self):
+        cfg = oracle.load_config()
+        cfg["lan"] = True
+        oracle.save_config(cfg)
+        live = {"app": "oracle", "lan": False, "atlases": []}
+        out = io.StringIO()
+        with mock.patch.object(oracle, "call_oracle", return_value=live), \
+             mock.patch.object(oracle, "local_addresses", return_value=[("en0", "192.168.1.20", "")]), \
+             mock.patch.object(oracle, "is_wsl", return_value=False), \
+             mock.patch.object(oracle.sys, "platform", "linux"), \
+             mock.patch.object(oracle, "IS_WIN", False), \
+             mock.patch.object(oracle, "check_linux_firewall"), \
+             contextlib.redirect_stdout(out):
+            code = oracle.cmd_doctor(oracle.build_parser().parse_args(["doctor"]))
+        self.assertEqual(code, 1)
+        self.assertIn("LAN mode was turned on after Oracle started", out.getvalue())
+        self.assertIn("python3 oracle.py restart", out.getvalue())
+        self.assertIn("http://192.168.1.20:8800", out.getvalue())
+
+    def test_start_warns_when_the_running_oracle_has_the_other_mode(self):
+        cfg = oracle.load_config()
+        cfg["lan"] = True
+        oracle.save_config(cfg)
+        out = io.StringIO()
+        with mock.patch.object(oracle, "call_oracle", return_value={"app": "oracle", "lan": False}), \
+             contextlib.redirect_stdout(out):
+            oracle.cmd_start(oracle.build_parser().parse_args(["start", "--no-browser"]))
+        self.assertIn("python3 oracle.py restart", out.getvalue())
+
+
+class PlainHTTPTest(TempDirCase):
+    def test_tls_handshake_is_closed_at_once(self):
+        import threading
+        port = free_port()
+        write(self.db / "site" / "index.html", "hi")
+        handler = oracle.functools.partial(oracle.StaticHandler, directory=str(self.db / "site"))
+        httpd = oracle.Server(("127.0.0.1", port), handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+            started = time.time()
+            s.sendall(bytes.fromhex("16030100a5010000a10303") + b"\0" * 32)
+            self.assertEqual(s.recv(10), b"")                 # hung up, didn't wait
+            self.assertLess(time.time() - started, 2)
+        with opener.open(f"http://127.0.0.1:{port}/", timeout=5) as resp:
+            self.assertEqual(resp.read(), b"hi")
+
+
 class AutostartTest(unittest.TestCase):
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux autostart entry")
     def test_desktop_entry(self):
