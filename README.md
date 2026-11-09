@@ -161,8 +161,8 @@ python3 oracle.py doctor
 It checks the usual causes and tells you what to do about each one:
 
 - **Oracle is still private.** If Oracle was already running when you turned LAN mode on (for example, because it starts at login), it keeps listening on this computer only. Running `python3 oracle.py` again just reopens it. `python3 oracle.py restart` fixes that.
-- **The firewall.** This is the most common cause. On Windows, it blocks everything on networks marked *Public*, and it remembers a cancelled "allow access" prompt as a block. On macOS, it can block Python or Node.js without asking. `python3 oracle.py doctor --fix` lets Oracle's ports through. Your system asks for your password or for administrator permission first. On Windows the rule only applies to Private networks, so mark your home Wi-Fi as Private.
-- **The wrong address.** VPNs, Docker and virtual machines add extra addresses. The doctor lists them all and marks the one to open on the phone.
+- **The firewall.** This is the most common cause. On Windows, it blocks everything on networks marked *Public*, and it remembers a cancelled "allow access" prompt as a block. On macOS, it can block Python or Node.js without asking. `python3 oracle.py doctor --fix` lets Oracle's ports through. Your system asks for your password or for administrator permission first. On Windows the rule only applies to Private networks, so `--fix` also offers to mark the network you use as Private. Answer *y* only for your home network or another one you trust.
+- **The wrong address.** VPNs, Docker and virtual machines add extra addresses, and a PC can be on the same network through two adapters. The doctor lists them all. If Oracle shows the wrong one, choose the right one and Oracle uses it everywhere: `python3 oracle.py config --address 192.168.1.117`.
 - **WSL.** Oracle running inside WSL can't be reached from other devices. Run it with Windows' own Python instead, by double-clicking `start-oracle.bat`.
 - **The phone's side.** The phone must be on the same Wi-Fi, not on mobile data or a guest network, and without a VPN. Some routers keep Wi-Fi devices from seeing each other (*AP isolation* or *client isolation*).
 
@@ -177,7 +177,7 @@ It checks the usual causes and tells you what to do about each one:
 | `oracle.py stop` | Stop a running Oracle and every atlas it started |
 | `oracle.py restart` | Restart Oracle in the background, applying changed settings (`--lan`, `--port N`, `--no-browser`) |
 | `oracle.py doctor` | Find out why other devices can't reach Oracle; `--fix` lets it through the firewall |
-| `oracle.py config` | Show the settings, or change them with `--db DIR`, `--port N`, `--lan on/off`, `--code CODE`, `--new-code` |
+| `oracle.py config` | Show the settings, or change them with `--db DIR`, `--port N`, `--lan on/off`, `--code CODE`, `--new-code`, `--address IP` |
 | `oracle.py autostart on/off/status` | Start Oracle at login |
 
 Settings are saved in `oracle.config.json` next to `oracle.py`. `--db` on a single command, or the `ORACLE_DB` environment variable, overrides the saved folder for that run only.
