@@ -69,7 +69,7 @@ ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 _local = build_opener(ProxyHandler({}))
 
 DEFAULT_CONFIG = {"db": None, "port": DEFAULT_PORT, "lan": False, "skip": [],
-                  "access_code": None, "session_secret": None}
+                  "access_code": None, "session_secret": None, "address": None}
 
 # Other devices on the network must enter the access code to use the dashboard.
 CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"     # no 0/o, 1/l/i to misread
@@ -200,8 +200,9 @@ _addresses = (0.0, [])
 def local_addresses(max_age: float = 30.0) -> list:
     """[(adapter, ip, kind)] for this computer's private IPv4 addresses.
 
-    Real Wi-Fi/Ethernet adapters come first, the one with the default route
-    first of all; VPN and virtual adapters (Docker, WSL, VMs) come last.
+    The address chosen with `config --address` comes first, then real
+    Wi-Fi/Ethernet adapters (the one with the default route first), then VPN
+    and virtual adapters (Docker, WSL, VMs).
     """
     global _addresses
     if time.time() - _addresses[0] < max_age:
@@ -220,9 +221,15 @@ def local_addresses(max_age: float = 30.0) -> list:
             continue
         seen.add(ip)
         found.append((name, ip, address_kind(name, ip)))
-    found.sort(key=lambda t: (t[2] != "", t[1] != route))
+    chosen = load_config().get("address")          # set with `config --address`
+    found.sort(key=lambda t: (t[1] != chosen, t[2] != "", t[1] != route))
     _addresses = (time.time(), found)
     return found
+
+
+def forget_addresses() -> None:
+    global _addresses
+    _addresses = (0.0, [])
 
 
 def best_lan_ip():
@@ -1333,6 +1340,7 @@ class Report:
     def __init__(self):
         self.rows, self.todo = [], []
         self.fix_plan, self.fix = [], None
+        self.public = []          # Public networks `--fix` may mark Private (Windows)
 
     def row(self, mark: str, label: str, text: str) -> None:
         self.rows.append((mark, label, text))
@@ -1369,7 +1377,7 @@ def check_mac_firewall(rep: Report, ports: list) -> None:
         rep.todo.append(("The Mac firewall may be blocking Python or Node.js.",
                          "python3 oracle.py doctor --fix   (it asks for your Mac password)"))
         rep.fix_plan = [" ".join(shlex.quote(c) for c in cmd) for cmd in cmds]
-        rep.fix = lambda: run_interactive(cmds)
+        rep.fix = lambda private=(): run_interactive(cmds)
 
 
 def run_interactive(cmds: list) -> bool:
@@ -1415,7 +1423,8 @@ def parse_windows_firewall(text: str) -> dict:
     return info
 
 
-def check_windows_firewall(rep: Report, ports: list, text=None) -> None:
+def check_windows_firewall(rep: Report, ports: list, text=None, adapter=None) -> None:
+    """`adapter` is the ipconfig name of the adapter other devices reach ("Ethernet adapter Ethernet")."""
     if text is None:
         ps = shutil.which("powershell") or shutil.which("pwsh")
         text = run_quiet([ps, "-NoProfile", "-NonInteractive", "-Command", WIN_CHECK], timeout=120) if ps else ""
@@ -1423,53 +1432,67 @@ def check_windows_firewall(rep: Report, ports: list, text=None) -> None:
     if not info["networks"] and not info["enabled"]:
         rep.row("?", "Firewall", "couldn't read the Windows Firewall settings")
     profile_of = {"Public": "Public", "Private": "Private", "DomainAuthenticated": "Domain"}
-    active = {profile_of.get(cat, cat) for _, cat in info["networks"]} or {"Private", "Public"}
+
+    def ours_alias(alias: str) -> bool:
+        return bool(adapter) and (adapter == alias or adapter.endswith(" " + alias))
+    known = any(ours_alias(alias) for alias, _ in info["networks"])
+    used = [(alias, cat) for alias, cat in info["networks"] if ours_alias(alias) or not known]
     for alias, cat in info["networks"]:
-        if cat == "Public":
-            rep.row("!!", "Network", f"'{alias}' is set to Public, so Windows blocks incoming connections on it")
-            rep.todo.append((f"Windows treats the network '{alias}' as Public.",
-                             f"If it's your home network: Settings > Network & internet > {alias} > "
-                             "Network profile type: Private."))
-        else:
+        if cat != "Public":
             rep.row("ok", "Network", f"'{alias}' is {cat}")
-    if info["enabled"] and not any(info["enabled"].get(p) for p in active):
+        elif (alias, cat) not in used:
+            rep.row("", "Network", f"'{alias}' is Public too, but other devices don't use it, so it doesn't matter")
+        else:
+            rep.row("!!", "Network", f"'{alias}' is set to Public, so Windows blocks incoming connections on it")
+            rep.public.append(alias)
+            rep.todo.append((f"Windows treats the network '{alias}' as Public.",
+                             "If it's your home network, `python3 oracle.py doctor --fix` can mark it Private,\n"
+                             f"     or do it yourself: Settings > Network & internet > {alias} > "
+                             "Network profile type: Private."))
+    # The firewall profiles that decide whether other devices get in.
+    target = {profile_of.get(cat, cat) for _, cat in used} or {"Private", "Public"}
+    if info["enabled"] and not any(info["enabled"].get(p) for p in target):
         return rep.row("ok", "Firewall", "off for this network")
     rep.row("", "Firewall", "on")
 
-    def covers(profile: str) -> bool:
-        return "Any" in profile or "All" in profile or any(p in profile for p in active)
+    def covers(profile: str, profiles: set) -> bool:
+        return "Any" in profile or "All" in profile or all(p in profile for p in profiles)
 
     ours = {os.path.normcase(p): label for label, p in firewall_programs()}
+    soon = target | ({"Private"} if rep.public else set())     # after --fix marks the network Private
     blocked = [(ours[os.path.normcase(os.path.expandvars(prog))], prog) for action, profile, prog in info["apps"]
-               if action == "Block" and covers(profile) and os.path.normcase(os.path.expandvars(prog)) in ours]
+               if action == "Block" and any(covers(profile, {p}) for p in soon)
+               and os.path.normcase(os.path.expandvars(prog)) in ours]
     for label, prog in blocked:
         rep.row("!!", "", f"{label} is blocked by a firewall rule ({prog})")
     allowed = {os.path.normcase(os.path.expandvars(prog)) for action, profile, prog in info["apps"]
-               if action == "Allow" and covers(profile)}
+               if action == "Allow" and covers(profile, target)}
     rule = info["rule"]
-    rule_ok = bool(rule and rule[0] and covers(rule[1]) and set(ports) <= rule[2])
+    rule_ok = bool(rule and rule[0] and covers(rule[1], target) and set(ports) <= rule[2])
     apps_ok = all(p in allowed for p in ours)
     if rule_ok:
         rep.row("ok", "", f"the '{WIN_RULE}' rule lets the ports in")
     elif apps_ok:
         rep.row("ok", "", "Python and Node.js are allowed")
     else:
-        rep.row("!!", "", "nothing lets Oracle's ports in yet")
-    if blocked or not (rule_ok or apps_ok):
-        rep.todo.append(("Windows Firewall blocks Oracle.",
-                         "python3 oracle.py doctor --fix   (Windows asks for permission)"))
+        rep.row("!!", "", "nothing lets Oracle's ports in on this network yet")
+    if blocked or not (rule_ok or apps_ok) or rep.public:
+        if blocked or not (rule_ok or apps_ok):
+            rep.todo.append(("Windows Firewall blocks Oracle.",
+                             "python3 oracle.py doctor --fix   (Windows asks for permission)"))
         rep.fix_plan = [f"add the firewall rule '{WIN_RULE}' for TCP ports {', '.join(map(str, ports))} "
                         "(Private and Domain networks only)"]
         if blocked:
             rep.fix_plan.append("remove the rules that block " + " and ".join(sorted({b[0] for b in blocked})))
-        rep.fix = lambda: fix_windows_firewall(ports, [p for _, p in firewall_programs()])
+        rep.fix = lambda private=(): fix_windows_firewall(ports, [p for _, p in firewall_programs()], private)
 
 
-def fix_windows_firewall(ports: list, programs: list) -> bool:
+def fix_windows_firewall(ports: list, programs: list, private=()) -> bool:
     def ps_str(s: str) -> str:
         return "'" + s.replace("'", "''") + "'"
     script = "\r\n".join([
         "$ErrorActionPreference = 'Continue'",
+        *[f"Set-NetConnectionProfile -InterfaceAlias {ps_str(alias)} -NetworkCategory Private" for alias in private],
         f"Remove-NetFirewallRule -DisplayName {ps_str(WIN_RULE)} -ErrorAction SilentlyContinue",
         f"New-NetFirewallRule -DisplayName {ps_str(WIN_RULE)} -Direction Inbound -Action Allow -Protocol TCP "
         f"-LocalPort {','.join(map(str, ports))} -Profile Private,Domain | Out-Null",
@@ -1510,7 +1533,7 @@ def check_linux_firewall(rep: Report, ports: list) -> None:
     rep.todo.append(("The Linux firewall probably blocks Oracle's ports.",
                      "python3 oracle.py doctor --fix   (it asks for your password)"))
     rep.fix_plan = [" ".join(shlex.quote(c) for c in cmd) for cmd in cmds]
-    rep.fix = lambda: run_interactive(cmds)
+    rep.fix = lambda private=(): run_interactive(cmds)
 
 
 def check_wsl(rep: Report) -> None:
@@ -1559,13 +1582,28 @@ def cmd_doctor(args) -> int:
     # 2. Which address should other devices use?
     addrs = local_addresses(max_age=0)
     best = addrs[0][1] if addrs else None
+    chosen = cfg.get("address")
     if not addrs:
         rep.row("!!", "Address", "no private network address: is this computer on Wi-Fi or Ethernet?")
         rep.todo.append(("This computer has no address on a local network.", "Connect it to your Wi-Fi or router."))
     for i, (name, ip, kind) in enumerate(addrs):
-        note = "  <- other devices use this one" if i == 0 else (
-            f"  ({kind}: other devices on your Wi-Fi can't use it)" if kind else "")
+        if i == 0:
+            note = "  <- chosen with config --address" if ip == chosen else "  <- Oracle shows this one"
+        else:
+            note = f"  ({kind}: other devices on your Wi-Fi can't use it)" if kind else ""
         rep.row("", "Address" if i == 0 else "", f"{ip:<15} {name or '(adapter unknown)'}{note}")
+    if chosen and chosen != best:
+        rep.row("!!", "", f"the address chosen with config --address ({chosen}) isn't on this computer now")
+        rep.todo.append((f"This computer no longer has the address {chosen}.",
+                         "Choose one it has:  python3 oracle.py config --address <address>\n"
+                         "     or let Oracle pick:  python3 oracle.py config --address \"\""))
+    real = [ip for _, ip, kind in addrs if not kind]
+    if len(real) > 1 and not chosen:
+        rep.todo.append((f"This computer is on the network through {len(real)} adapters: "
+                         f"{', '.join(real)}. Oracle can't tell which one the phone reaches.",
+                         "Pick the one that works from the phone (the address in the same network as the\n"
+                         "     phone, or the one you know is right). Oracle then shows it everywhere:\n"
+                         f"     python3 oracle.py config --address {real[1]}"))
     if addrs and addrs[0][2]:
         rep.todo.append((f"The only address found is a {addrs[0][2]} one ({best}).",
                          "Connect this computer to the same Wi-Fi as the phone, or turn the VPN off."))
@@ -1590,7 +1628,7 @@ def cmd_doctor(args) -> int:
     elif sys.platform == "darwin":
         check_mac_firewall(rep, ports)
     elif IS_WIN:
-        check_windows_firewall(rep, ports)
+        check_windows_firewall(rep, ports, adapter=addrs[0][0] if addrs else None)
     else:
         check_linux_firewall(rep, ports)
 
@@ -1603,11 +1641,23 @@ def cmd_doctor(args) -> int:
         if not rep.fix:
             say("Nothing to change in the firewall.")
         else:
+            private = []
+            for alias in rep.public:
+                answer = ""
+                if sys.stdin and sys.stdin.isatty():
+                    answer = input(f"\n  Is '{alias}' your home network, or another one you trust? "
+                                   "Mark it Private so other devices can connect? [y/N] ")
+                if answer.strip().lower() in ("y", "yes", "s", "si", "sì"):
+                    private.append(alias)
+                else:
+                    say(f"'{alias}' stays Public, and Windows keeps blocking other devices on it.")
             say("Changing the firewall:")
+            for alias in private:
+                print(f"    mark the network '{alias}' as Private")
             for line in rep.fix_plan:
                 print(f"    {line}")
-            if rep.fix():
-                say("Done. Now restart Oracle (python3 oracle.py restart) and try the other device again.")
+            if rep.fix(private):
+                say("Done. Check with `python3 oracle.py doctor`, then try the other device again.")
             else:
                 say("That didn't fully work; see the messages above.")
         return 0
@@ -1845,6 +1895,19 @@ def cmd_config(args) -> int:
     if args.new_code:
         cfg["access_code"] = new_code()
         changed = True
+    if args.address is not None:
+        forget_addresses()
+        address = args.address.strip()
+        if not address:
+            cfg["address"] = None
+        elif client_scope(address) != "lan" or ":" in address:
+            say(f"{address} isn't a local network address (they look like 192.168.1.20).")
+            return 1
+        else:
+            if address not in [ip for _, ip, _ in local_addresses(max_age=0)]:
+                say(f"Note: this computer doesn't have the address {address} right now.")
+            cfg["address"] = address
+        changed = True
     if args.lan is not None:
         cfg["lan"] = args.lan == "on"
         changed = True
@@ -1852,6 +1915,7 @@ def cmd_config(args) -> int:
         changed = True
     if changed:
         save_config(cfg)
+        forget_addresses()
     shown = {k: v for k, v in cfg.items() if k != "session_secret"}
     print(json.dumps({**shown, "db (resolved)": str(resolve_db(None, cfg))}, indent=2))
     if cfg["lan"]:
@@ -1934,6 +1998,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="open the atlases and the dashboard (with an access code) to your network")
     s.add_argument("--code", metavar="CODE", help="set your own access code for other devices")
     s.add_argument("--new-code", action="store_true", help="replace the access code with a new random one")
+    s.add_argument("--address", metavar="IP",
+                   help="the address other devices use, when this computer has several ('' picks automatically)")
 
     s = sub.add_parser("autostart", help="start Oracle when you log in")
     s.add_argument("action", choices=("on", "off", "status"))

@@ -570,6 +570,121 @@ class FirewallTest(TempDirCase):
                             for p in rep.fix_plan))
 
 
+IPCONFIG_TWO_ADAPTERS = """
+Windows IP Configuration
+
+Ethernet adapter Ethernet 2:
+
+   Connection-specific DNS Suffix  . :
+   IPv4 Address. . . . . . . . . . . : 192.168.1.140
+   Default Gateway . . . . . . . . . : 192.168.1.1
+
+Ethernet adapter Ethernet:
+
+   IPv4 Address. . . . . . . . . . . : 192.168.1.117
+   Default Gateway . . . . . . . . . : 192.168.1.1
+
+Ethernet adapter vEthernet (Default Switch):
+
+   IPv4 Address. . . . . . . . . . . : 172.30.176.1
+"""
+
+WIN_BOTH_PUBLIC = """PROFILE|Ethernet 2|Public
+PROFILE|Ethernet|Public
+FW|Domain|True
+FW|Private|True
+FW|Public|True
+"""
+
+
+class TwoAdaptersTest(TempDirCase):
+    """A Windows PC on the same network through two adapters, both Public."""
+
+    def setUp(self):
+        super().setUp()
+        oracle.forget_addresses()
+        self.addCleanup(oracle.forget_addresses)
+        for p in (mock.patch.object(oracle, "IS_WIN", True),
+                  mock.patch.object(oracle, "route_ip", return_value="192.168.1.140"),
+                  mock.patch.object(oracle, "firewall_programs", return_value=[("Python", "C:\\py\\python.exe")])):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def addresses(self):
+        with mock.patch.object(oracle, "run_quiet", return_value=IPCONFIG_TWO_ADAPTERS):
+            return oracle.local_addresses(max_age=0)
+
+    def test_the_chosen_address_comes_first(self):
+        self.assertEqual(self.addresses()[0][1], "192.168.1.140")      # default route
+        cfg = oracle.load_config()
+        cfg["address"] = "192.168.1.117"
+        oracle.save_config(cfg)
+        addrs = self.addresses()
+        self.assertEqual(addrs[0][:2], ("Ethernet adapter Ethernet", "192.168.1.117"))
+        self.assertEqual(addrs[-1][2], "virtual")
+
+    def test_only_the_network_in_use_is_flagged(self):
+        rep = oracle.Report()
+        oracle.check_windows_firewall(rep, [8800, 8010], text=WIN_BOTH_PUBLIC, adapter="Ethernet adapter Ethernet")
+        self.assertEqual(rep.public, ["Ethernet"])
+        self.assertIn(("", "Network", "'Ethernet 2' is Public too, but other devices don't use it, so it doesn't matter"),
+                      rep.rows)
+        self.assertIsNotNone(rep.fix)
+
+    def test_a_private_only_rule_does_not_count_on_a_public_network(self):
+        text = WIN_BOTH_PUBLIC + "ORACLE|True|Private, Domain|8800,8010\n"
+        rep = oracle.Report()
+        oracle.check_windows_firewall(rep, [8800, 8010], text=text, adapter="Ethernet adapter Ethernet")
+        self.assertIn(("!!", "", "nothing lets Oracle's ports in on this network yet"), rep.rows)
+        self.assertIsNotNone(rep.fix)
+
+    def test_after_the_fix_everything_is_fine(self):
+        text = ("PROFILE|Ethernet 2|Public\nPROFILE|Ethernet|Private\nFW|Private|True\nFW|Public|True\n"
+                "ORACLE|True|Private, Domain|8800,8010\n")
+        rep = oracle.Report()
+        oracle.check_windows_firewall(rep, [8800, 8010], text=text, adapter="Ethernet adapter Ethernet")
+        self.assertEqual((rep.todo, rep.fix, rep.public), ([], None, []))
+
+    def test_fix_script_marks_the_network_private_and_adds_the_rule(self):
+        with mock.patch.object(oracle.subprocess, "run") as run:
+            run.return_value.returncode = 0
+            self.assertTrue(oracle.fix_windows_firewall([8800, 8010], ["C:\\py\\python.exe"], ["Ethernet"]))
+        script = (oracle.LOG_DIR / "fix-firewall.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn("Set-NetConnectionProfile -InterfaceAlias 'Ethernet' -NetworkCategory Private", script)
+        self.assertIn("-LocalPort 8800,8010 -Profile Private,Domain", script)
+        self.assertIn("-Verb RunAs", run.call_args[0][0][-1])
+
+    def test_doctor_suggests_choosing_the_address(self):
+        live = {"app": "oracle", "lan": True, "atlases": []}
+
+        def quiet(cmd, **kw):
+            return IPCONFIG_TWO_ADAPTERS if cmd == ["ipconfig"] else WIN_BOTH_PUBLIC
+        out = io.StringIO()
+        with mock.patch.object(oracle, "call_oracle", return_value=live), \
+             mock.patch.object(oracle, "run_quiet", side_effect=quiet), \
+             mock.patch.object(oracle.shutil, "which", return_value="powershell"), \
+             mock.patch.object(oracle, "port_open", return_value=True), \
+             mock.patch.object(oracle, "is_wsl", return_value=False), \
+             mock.patch.object(oracle.sys, "platform", "win32"), \
+             contextlib.redirect_stdout(out):
+            oracle.cmd_doctor(oracle.build_parser().parse_args(["doctor"]))
+        text = out.getvalue()
+        self.assertIn("python3 oracle.py config --address 192.168.1.117", text)
+        self.assertIn("'Ethernet 2' is set to Public", text)      # .140 is still the one in use here
+        self.assertNotIn("'Ethernet' is set to Public", text)
+
+    def test_config_address_validation(self):
+        def config(*argv):
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 mock.patch.object(oracle, "run_quiet", return_value=IPCONFIG_TWO_ADAPTERS):
+                return oracle.cmd_config(oracle.build_parser().parse_args(["config", *argv]))
+        self.assertEqual(config("--address", "8.8.8.8"), 1)
+        self.assertEqual(config("--address", "192.168.1.117"), 0)
+        self.assertEqual(oracle.load_config()["address"], "192.168.1.117")
+        self.assertEqual(config("--address", ""), 0)
+        self.assertIsNone(oracle.load_config()["address"])
+
+
 class DoctorTest(TempDirCase):
     def test_lan_turned_on_after_start_says_restart(self):
         cfg = oracle.load_config()
